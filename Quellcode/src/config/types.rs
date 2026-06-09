@@ -97,6 +97,11 @@ pub struct Config {
     #[serde(default = "default_bazaar_tax_rate")]
     pub bazaar_tax_rate: f64,
 
+    /// Reset persisted FIFO Bazaar buy-cost lots on startup, but only when
+    /// there are no tracked Bazaar orders and the cached player inventory is empty.
+    #[serde(default)]
+    pub reset_bazaar_buy_costs_on_startup: bool,
+
     /// Delay in milliseconds between consecutive auction listing commands
     /// (SellToAuction). Prevents Hypixel from kicking the bot with
     /// "Sending packets too fast!" during bulk listings. Default: 1500ms.
@@ -310,6 +315,7 @@ impl Default for Config {
             bazaar_order_check_interval_seconds: default_bazaar_order_check_interval_seconds(),
             bazaar_order_cancel_minutes_per_million: default_bazaar_order_cancel_minutes_per_million(),
             bazaar_tax_rate: default_bazaar_tax_rate(),
+            reset_bazaar_buy_costs_on_startup: false,
             auction_listing_delay_ms: default_auction_listing_delay_ms(),
             enable_bazaar_flips: true,
             enable_ah_flips: true,
@@ -511,6 +517,7 @@ mod tests {
         assert!(toml.contains("proxy_credentials"), "proxy_credentials should appear in default config");
         assert!(toml.contains("multi_switch_time"), "multi_switch_time should appear in default config");
         assert!(toml.contains("discord_id"), "discord_id should appear in default config");
+        assert!(toml.contains("reset_bazaar_buy_costs_on_startup"), "reset_bazaar_buy_costs_on_startup should appear in default config");
     }
 
     #[test]

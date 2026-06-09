@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicI64, Ordering},
     Arc, Mutex,
 };
 
@@ -70,6 +70,8 @@ pub struct WebSharedState {
     pub detected_cofl_license: Arc<std::sync::atomic::AtomicU32>,
     /// Shared profit tracker for AH and Bazaar realized profits.
     pub profit_tracker: Arc<crate::profit::ProfitTracker>,
+    /// Local lot-accounted Bazaar profit total used by the web graph.
+    pub bz_local_profit_total: Arc<AtomicI64>,
     /// Session-only anonymize toggle for the web panel (defaults to OFF).
     /// Not persisted to config — resets to OFF on each process start.
     pub anonymize_webhook_name: Arc<AtomicBool>,
@@ -156,6 +158,7 @@ struct ProfitResponse {
     ah_total: i64,
     bz_total: i64,
     uptime_seconds: u64,
+    bz_unknown_cost_basis: bool,
 }
 
 /// Default auction duration used when the client doesn't provide one.
@@ -172,6 +175,7 @@ struct PublicProfitResponse {
     uptime_seconds: u64,
     ah_points: Vec<(u64, i64)>,
     bz_points: Vec<(u64, i64)>,
+    bz_unknown_cost_basis: bool,
 }
 
 #[derive(Serialize)]
@@ -375,7 +379,8 @@ fn format_og_uptime(secs: u64) -> String {
 }
 
 async fn index_page(State(s): State<WebSharedState>) -> Html<String> {
-    let (ah_total, bz_total) = s.profit_tracker.totals();
+    let (ah_total, _bz_total) = s.profit_tracker.totals();
+    let bz_total = s.bz_local_profit_total.load(Ordering::Relaxed);
     let total = ah_total + bz_total;
     let uptime = s.previous_session_secs + s.started_at.elapsed().as_secs();
     let hours = uptime as f64 / 3600.0;
@@ -1383,13 +1388,15 @@ async fn download_latest_log() -> impl IntoResponse {
 // ── WebSocket handler for live chat ──────────────────────────
 
 async fn get_profit(State(s): State<WebSharedState>) -> Json<ProfitResponse> {
-    let (ah_total, bz_total) = s.profit_tracker.totals();
+    let (ah_total, _bz_total) = s.profit_tracker.totals();
+    let bz_total = s.bz_local_profit_total.load(Ordering::Relaxed);
     Json(ProfitResponse {
         ah_points: s.profit_tracker.ah_points(),
         bz_points: s.profit_tracker.bz_points(),
         ah_total,
         bz_total,
         uptime_seconds: s.previous_session_secs + s.started_at.elapsed().as_secs(),
+        bz_unknown_cost_basis: s.bazaar_tracker.unknown_cost_basis_sell_count() > 0,
     })
 }
 
@@ -1397,7 +1404,8 @@ async fn get_profit(State(s): State<WebSharedState>) -> Json<ProfitResponse> {
 /// Returns anonymized profit data (no IGN, no account info) for the
 /// login page display and OpenGraph embeds.
 async fn get_profit_public(State(s): State<WebSharedState>) -> Json<PublicProfitResponse> {
-    let (ah_total, bz_total) = s.profit_tracker.totals();
+    let (ah_total, _bz_total) = s.profit_tracker.totals();
+    let bz_total = s.bz_local_profit_total.load(Ordering::Relaxed);
     let total = ah_total + bz_total;
     let uptime = s.previous_session_secs + s.started_at.elapsed().as_secs();
     let hours = uptime as f64 / 3600.0;
@@ -1410,13 +1418,15 @@ async fn get_profit_public(State(s): State<WebSharedState>) -> Json<PublicProfit
         uptime_seconds: uptime,
         ah_points: s.profit_tracker.ah_points(),
         bz_points: s.profit_tracker.bz_points(),
+        bz_unknown_cost_basis: s.bazaar_tracker.unknown_cost_basis_sell_count() > 0,
     })
 }
 
 /// Public OG image endpoint — no authentication required.
 /// Generates a 1200×630 PNG stats card for Discord / social media embeds.
 async fn get_og_image(State(s): State<WebSharedState>) -> impl IntoResponse {
-    let (ah_total, bz_total) = s.profit_tracker.totals();
+    let (ah_total, _bz_total) = s.profit_tracker.totals();
+    let bz_total = s.bz_local_profit_total.load(Ordering::Relaxed);
     let total = ah_total + bz_total;
     let uptime = s.previous_session_secs + s.started_at.elapsed().as_secs();
     let hours = uptime as f64 / 3600.0;

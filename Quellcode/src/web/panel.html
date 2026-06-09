@@ -191,6 +191,8 @@ a{color:var(--accent2);text-decoration:none}
 .profit-stat-box{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:clamp(18px,2vw,28px);text-align:center}
 .profit-stat-box .label{font-size:clamp(.78rem,.9vw,.92rem);color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
 .profit-stat-box .value{font-size:clamp(1.6rem,2.5vw,2.4rem);font-weight:700;color:var(--success)}
+.profit-note{font-size:.82rem;color:var(--text-dim);line-height:1.4;margin-top:8px}
+.profit-note.warn{color:var(--warning)}
 /* Config GUI */
 .cfg-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}
 .cfg-row:last-child{border-bottom:none}
@@ -390,7 +392,7 @@ a{color:var(--accent2);text-decoration:none}
             <canvas id="chart-bz" height="400"></canvas>
         </div>
         <div class="profit-stats">
-            <div class="profit-stat-box"><div class="label">Profit</div><div class="value" id="bz-profit-total">0</div></div>
+            <div class="profit-stat-box"><div class="label">Profit</div><div class="value" id="bz-profit-total">0</div><div class="profit-note warn" id="bz-cost-basis-note" style="display:none">UNKNOWN_COST_BASIS sells are ignored until matching FIFO BUY lots exist.</div></div>
             <div class="profit-stat-box"><div class="label">Uptime</div><div class="value" id="bz-uptime">—</div></div>
             <div class="profit-stat-box"><div class="label">P/H</div><div class="value" id="bz-per-hour">0</div></div>
         </div>
@@ -1459,6 +1461,8 @@ async function fetchProfit() {
         $('ah-per-hour').textContent = hours > 0 ? formatProfitLabel(d.ah_total / hours) : '0';
 
         $('bz-profit-total').textContent = formatProfitLabel(d.bz_total);
+        const bzNote = $('bz-cost-basis-note');
+        if (bzNote) bzNote.style.display = d.bz_unknown_cost_basis ? 'block' : 'none';
         $('bz-uptime').textContent = upStr;
         $('bz-per-hour').textContent = hours > 0 ? formatProfitLabel(d.bz_total / hours) : '0';
 

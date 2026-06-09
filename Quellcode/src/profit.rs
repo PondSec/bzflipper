@@ -63,11 +63,24 @@ impl ProfitTracker {
         }
     }
 
-    /// Replace the BZ total with an authoritative value (e.g. from `/cofl bz l`
-    /// accumulated profit) and record a new data-point so the chart updates.
+    /// Replace the BZ total with a locally verified value and record a new
+    /// data-point so the chart updates.
     pub fn set_bz_total(&self, total: i64) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.bz_total = total;
+            inner.bz_points.push((now_unix(), total));
+        }
+    }
+
+    /// Rebuild the Bazaar chart around a corrected total.
+    ///
+    /// This is used when an older bad cost basis produced a bogus negative
+    /// point: rather than keeping that spike in the graph, start a fresh BZ
+    /// series at the corrected locally verified total.
+    pub fn reset_bz_series(&self, total: i64) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.bz_total = total;
+            inner.bz_points.clear();
             inner.bz_points.push((now_unix(), total));
         }
     }
