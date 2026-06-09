@@ -1,0 +1,13 @@
+node_modules/
+.DS_Store
+.minecraft-auth-cache/
+config.json
+advanced.config.json
+client-assist.config.json
+advanced.*-test.json
+advanced.diagnostics*.json
+advanced.connection-test.json
+advanced.spawn-test.json
+advanced.summary-test.json
+logs/
+npm-debug.log*

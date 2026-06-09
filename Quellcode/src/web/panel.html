@@ -1,0 +1,1711 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<!-- OG_META_TAGS -->
+<title>Frikadellen BAF — Control Panel</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+:root,[data-theme="midnight"]{--bg:#0b0d17;--bg-card:#111425;--surface:#171a2e;--border:#1e2240;--text:#c9cde8;--text-dim:#7b82a8;--heading:#eaedf9;--accent:#6c5ce7;--accent2:#a29bfe;--success:#00cec9;--danger:#ff5f56;--warn:#ffbd2e;--radius:10px;--lore-bg:#1a0e2e;--lore-border:#2d1b4e}
+[data-theme="obsidian"]{--bg:#0e0e0e;--bg-card:#181818;--surface:#222;--border:#333;--text:#d4d4d4;--text-dim:#888;--heading:#f0f0f0;--accent:#e74c3c;--accent2:#ff6b6b;--success:#2ecc71;--danger:#e74c3c;--warn:#f39c12;--lore-bg:#1a1a1a;--lore-border:#333}
+[data-theme="emerald"]{--bg:#0a1612;--bg-card:#0f2018;--surface:#15291f;--border:#1e3a2b;--text:#b8d8c8;--text-dim:#6b9b82;--heading:#e0f0e8;--accent:#00b894;--accent2:#55efc4;--success:#00cec9;--danger:#ff5f56;--warn:#fdcb6e;--lore-bg:#0d1f16;--lore-border:#1e3a2b}
+[data-theme="sakura"]{--bg:#1a0f18;--bg-card:#221520;--surface:#2d1b28;--border:#3d2535;--text:#e0c8d8;--text-dim:#a07898;--heading:#f5e0f0;--accent:#e84393;--accent2:#fd79a8;--success:#00cec9;--danger:#ff5f56;--warn:#fdcb6e;--lore-bg:#200e1c;--lore-border:#3d2535}
+[data-theme="ocean"]{--bg:#0a1628;--bg-card:#0f1e35;--surface:#152642;--border:#1e3455;--text:#b8d0e8;--text-dim:#6890b8;--heading:#e0f0ff;--accent:#0984e3;--accent2:#74b9ff;--success:#00cec9;--danger:#ff5f56;--warn:#ffeaa7;--lore-bg:#0c1a30;--lore-border:#1e3455}
+html{font-size:16px}
+body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);line-height:1.6;min-height:100vh}
+a{color:var(--accent2);text-decoration:none}
+
+/* Layout */
+.header{background:var(--bg-card);border-bottom:1px solid var(--border);padding:18px 32px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:10}
+.header h1{font-size:1.35rem;color:var(--heading);font-weight:700}
+.header h1 span{color:var(--accent2)}
+.header .links{display:flex;gap:18px;font-size:.92rem;align-items:center}
+.main{max-width:1800px;margin:0 auto;padding:clamp(16px,3vw,40px)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:clamp(16px,2vw,28px);margin-bottom:clamp(16px,2vw,28px)}
+@media(max-width:768px){
+    .grid{grid-template-columns:1fr}
+    .main{padding:12px}
+    .header{padding:10px 14px;flex-wrap:wrap;gap:8px}
+    .header h1{font-size:1rem}
+    .header .links{gap:8px;font-size:.75rem}
+    .status-grid{grid-template-columns:1fr 1fr}
+    .inv-grid{grid-template-columns:repeat(9,1fr);gap:2px}
+    .inv-slot{border-radius:4px}
+    .chat-box{height:300px}
+    .card{padding:16px}
+    .card h2{font-size:1rem;margin-bottom:12px}
+    .btn{padding:10px 16px;font-size:.85rem}
+    .auction-table{font-size:.78rem}
+    .auction-table td{padding:8px 6px}
+    .auction-table th{padding:4px 6px;font-size:.7rem}
+}
+
+/* Cards */
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:clamp(18px,2vw,28px) clamp(20px,2.5vw,32px)}
+.card h2{font-size:clamp(1rem,1.2vw,1.2rem);color:var(--heading);margin-bottom:clamp(14px,1.5vw,20px);font-weight:700}
+
+/* Status */
+.status-grid{display:grid;grid-template-columns:1fr 1fr;gap:clamp(10px,1vw,16px)}
+.status-item{background:var(--surface);border-radius:8px;padding:clamp(10px,1.2vw,16px) clamp(14px,1.5vw,20px)}
+.status-item .label{font-size:clamp(.72rem,.85vw,.85rem);color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px}
+.status-item .value{font-size:clamp(1rem,1.2vw,1.2rem);color:var(--heading);font-weight:600;margin-top:4px}
+
+/* Buttons */
+.btn{display:inline-flex;align-items:center;gap:8px;padding:clamp(10px,1vw,14px) clamp(18px,2vw,26px);border-radius:8px;font-weight:600;font-size:clamp(.88rem,1vw,1rem);border:none;cursor:pointer;transition:background .2s,transform .15s}
+.btn:hover{transform:translateY(-1px)}
+.btn:active{transform:translateY(0)}
+.btn-pause{background:var(--warn);color:#1a1a1a}
+.btn-resume{background:var(--success);color:#1a1a1a}
+.btn-sm{padding:6px 14px;font-size:.8rem}
+.btn-download{background:var(--surface);color:var(--text);text-decoration:none;border:1px solid var(--border)}
+
+/* Toggles */
+.toggle-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}
+.toggle-row:last-child{border-bottom:none}
+.toggle-label{font-size:.92rem}
+.toggle{position:relative;width:44px;height:24px;cursor:pointer}
+.toggle input{opacity:0;width:0;height:0}
+.toggle .slider{position:absolute;inset:0;background:var(--surface);border-radius:24px;border:1px solid var(--border);transition:background .2s}
+.toggle .slider::before{content:'';position:absolute;width:18px;height:18px;border-radius:50%;background:#fff;left:2px;top:2px;transition:transform .2s}
+.toggle input:checked+.slider{background:var(--accent);border-color:var(--accent)}
+.toggle input:checked+.slider::before{transform:translateX(20px)}
+
+/* Accounts */
+.account-list{display:flex;flex-direction:column;gap:8px}
+.account-item{display:flex;align-items:center;gap:12px;background:var(--surface);border-radius:8px;padding:10px 14px;cursor:pointer;border:1px solid transparent;transition:border-color .2s,background .2s}
+.account-item:hover{background:rgba(108,92,231,.1);border-color:var(--accent2)}
+.account-item.active{border-color:var(--accent);background:rgba(108,92,231,.12)}
+.account-head{width:32px;height:32px;border-radius:4px;image-rendering:pixelated;flex-shrink:0}
+.account-info{display:flex;flex-direction:column}
+.account-name{font-size:.9rem;font-weight:600;color:var(--heading)}
+.account-badge{font-size:.68rem;color:var(--accent2);text-transform:uppercase;letter-spacing:.5px}
+
+/* Inventory */
+.inv-grid{display:grid;grid-template-columns:repeat(9,1fr);gap:4px}
+.inv-slot{aspect-ratio:1;background:var(--surface);border:1px solid var(--border);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:.65rem;text-align:center;padding:2px;overflow:visible;cursor:default;position:relative}
+.inv-slot.has-item{border-color:var(--accent);background:rgba(108,92,231,.08)}
+.inv-slot .count{position:absolute;bottom:1px;right:3px;font-size:.6rem;color:var(--warn);font-weight:700}
+.inv-slot:hover .tooltip{display:block}
+.inv-slot .item-icon{width:80%;height:80%;object-fit:contain;image-rendering:pixelated}
+.gv-slot{aspect-ratio:1;background:var(--surface);border:1px solid var(--border);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:.6rem;text-align:center;padding:2px;overflow:visible;cursor:default;position:relative}
+.gv-slot.has-item{border-color:var(--accent);background:rgba(108,92,231,.08)}
+.gv-slot .item-icon{width:80%;height:80%;object-fit:contain;image-rendering:pixelated}
+.gv-slot .count{position:absolute;bottom:1px;right:3px;font-size:.55rem;color:var(--warn);font-weight:700}
+.gv-slot .slot-num{position:absolute;top:1px;left:3px;font-size:.5rem;color:var(--text-dim);opacity:.6}
+.gv-slot:hover .tooltip{display:block}
+.tooltip{display:none;position:fixed;background:var(--lore-bg,#1a0e2e);border:2px solid var(--lore-border,#2d1b4e);border-radius:6px;padding:10px 14px;font-size:.75rem;white-space:pre-line;z-index:100;color:var(--heading);pointer-events:none;min-width:240px;max-width:420px;line-height:1.5;box-shadow:0 6px 20px rgba(0,0,0,.6);font-family:'JetBrains Mono','Fira Code',monospace}
+.tooltip .tip-title{font-weight:700;color:var(--accent2);margin-bottom:6px;font-size:.82rem}
+.tooltip .tip-lore{color:var(--text-dim);font-size:.72rem;line-height:1.6}
+
+/* Auctions */
+.auction-table{width:100%;border-collapse:collapse;font-size:clamp(.82rem,.95vw,.95rem)}
+.auction-table th{text-align:left;color:var(--text-dim);font-size:clamp(.72rem,.8vw,.82rem);text-transform:uppercase;letter-spacing:.5px;padding:6px 10px;border-bottom:1px solid var(--border)}
+.auction-table td{padding:10px;border-bottom:1px solid rgba(30,34,64,.5);vertical-align:middle}
+.auction-table tr:last-child td{border-bottom:none}
+.auction-table tr{position:relative}
+.auction-table tr:hover td{background:rgba(108,92,231,.05)}
+.auction-table td:hover .tooltip{display:block}
+.auction-icon{width:28px;height:28px;image-rendering:pixelated;border-radius:4px;vertical-align:middle}
+.auction-bid{color:var(--warn);font-weight:700}
+.auction-bin{display:inline-block;background:var(--success);color:#000;font-size:.65rem;font-weight:700;padding:1px 5px;border-radius:4px;margin-left:4px}
+.auction-time{font-family:'JetBrains Mono','Fira Code',monospace;font-size:.78rem;color:var(--text-dim)}
+.auction-time.urgent{color:var(--danger)}
+.auction-empty{color:var(--text-dim);font-size:.85rem;text-align:center;padding:16px 0}
+
+/* Chat */
+.chat-box{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);display:flex;flex-direction:column;height:clamp(320px,40vh,480px)}
+.chat-messages{flex:1;overflow-y:auto;padding:14px 18px;font-family:'JetBrains Mono','Fira Code',monospace;font-size:clamp(.78rem,.9vw,.92rem);line-height:1.7;color:var(--text)}
+.chat-messages .msg{margin-bottom:2px;word-break:break-word}
+.chat-input-row{display:flex;border-top:1px solid var(--border)}
+.chat-input-row input{flex:1;background:transparent;border:none;color:var(--text);padding:10px 14px;font-family:'JetBrains Mono','Fira Code',monospace;font-size:.82rem;outline:none}
+.chat-input-row button{background:var(--accent);color:#fff;border:none;padding:10px 18px;cursor:pointer;font-weight:600;font-size:.82rem}
+.chat-input-row button:hover{background:var(--accent2)}
+
+/* MC color codes → CSS */
+.mc-0{color:#000}.mc-1{color:#0000AA}.mc-2{color:#00AA00}.mc-3{color:#00AAAA}
+.mc-4{color:#AA0000}.mc-5{color:#AA00AA}.mc-6{color:#FFAA00}.mc-7{color:#AAAAAA}
+.mc-8{color:#555555}.mc-9{color:#5555FF}.mc-a{color:#55FF55}.mc-b{color:#55FFFF}
+.mc-c{color:#FF5555}.mc-d{color:#FF55FF}.mc-e{color:#FFFF55}.mc-f{color:#FFFFFF}
+.mc-l{font-weight:bold}.mc-o{font-style:italic}.mc-n{text-decoration:underline}
+.mc-m{text-decoration:line-through}
+
+/* Theme selector */
+.theme-picker{position:relative;display:inline-flex;align-items:center}
+.theme-btn{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:5px 12px;color:var(--text);cursor:pointer;font-size:.78rem;display:flex;align-items:center;gap:5px;transition:border-color .2s}
+.theme-btn:hover{border-color:var(--accent)}
+.theme-dropdown{display:none;position:absolute;top:100%;right:0;margin-top:6px;background:var(--bg-card);border:1px solid var(--border);border-radius:8px;overflow:hidden;min-width:160px;box-shadow:0 8px 24px rgba(0,0,0,.5);z-index:50}
+.theme-picker.open .theme-dropdown{display:block}
+.theme-opt{display:flex;align-items:center;gap:8px;padding:9px 14px;cursor:pointer;font-size:.82rem;color:var(--text);transition:background .15s}
+.theme-opt:hover{background:var(--surface)}
+.theme-opt.active{color:var(--accent2);font-weight:600}
+.theme-swatch{width:14px;height:14px;border-radius:50%;border:1px solid rgba(255,255,255,.15);flex-shrink:0}
+
+/* Login overlay */
+.login-overlay{position:fixed;inset:0;background:rgba(11,13,23,.97);z-index:100;display:flex;align-items:center;justify-content:center;overflow-y:auto;padding:20px}
+
+/* List-item modal */
+.modal-overlay{position:fixed;inset:0;background:rgba(11,13,23,.85);z-index:200;display:flex;align-items:center;justify-content:center}
+.modal-overlay.hidden{display:none}
+.modal-box{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:28px 32px;width:340px;max-width:92vw}
+.modal-box h3{color:var(--heading);margin:0 0 18px;font-size:1.1rem}
+.modal-field{margin-bottom:14px}
+.modal-field label{display:block;color:var(--text-dim);font-size:.82rem;margin-bottom:5px}
+.modal-field input{width:100%;padding:9px 12px;background:var(--surface);border:1px solid var(--border);border-radius:7px;color:var(--text);font-size:.92rem;outline:none;box-sizing:border-box}
+.modal-field input:focus{border-color:var(--accent)}
+.modal-actions{display:flex;gap:10px;margin-top:20px}
+.modal-actions .btn{flex:1}
+/* Make inventory slots with items feel clickable */
+.inv-slot.has-item{cursor:pointer}
+.inv-slot.has-item:hover{border-color:var(--accent2);background:rgba(108,92,231,.18)}
+.login-overlay.hidden{display:none}
+.login-container{display:flex;flex-direction:column;align-items:center;gap:32px;width:100%;max-width:900px}
+.login-box{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:40px 44px;width:420px;max-width:90vw;text-align:center}
+.login-box h2{color:var(--heading);margin-bottom:8px;font-size:1.4rem}
+.login-box p{color:var(--text-dim);font-size:.95rem;margin-bottom:24px}
+.login-box input{width:100%;padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:1rem;outline:none;margin-bottom:14px}
+.login-box input:focus{border-color:var(--accent)}
+.login-box button{width:100%;padding:12px;background:var(--accent);color:#fff;border:none;border-radius:8px;font-weight:600;font-size:1rem;cursor:pointer}
+.login-box button:hover{background:var(--accent2)}
+.login-error{color:var(--danger);font-size:.88rem;margin-bottom:12px;display:none}
+.login-links{display:flex;gap:18px;justify-content:center;margin-top:18px;flex-wrap:wrap}
+.login-links a{color:var(--accent2);font-size:.92rem;text-decoration:none;display:flex;align-items:center;gap:6px;transition:color .2s}
+.login-links a:hover{color:var(--heading)}
+.login-profit-section{width:100%;max-width:900px}
+.login-profit-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:20px}
+@media(max-width:600px){.login-profit-stats{grid-template-columns:1fr}}
+.login-profit-chart{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:20px}
+/* Tab system */
+.tab-bar{display:flex;gap:0;margin-bottom:clamp(18px,2.5vw,28px);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+.tab-btn{flex:1;padding:clamp(12px,1.5vw,16px) clamp(16px,2vw,24px);background:var(--bg-card);border:none;color:var(--text-dim);font-weight:600;font-size:clamp(.88rem,1vw,1rem);cursor:pointer;transition:background .2s,color .2s;border-right:1px solid var(--border)}
+.tab-btn:last-child{border-right:none}
+.tab-btn:hover{background:var(--surface);color:var(--heading)}
+.tab-btn.active{background:var(--accent);color:#fff}
+.tab-content{display:none}
+.tab-content.active{display:block}
+.profit-container{display:grid;grid-template-columns:2fr 1fr;gap:clamp(18px,2.5vw,28px)}
+@media(max-width:768px){.profit-container{grid-template-columns:1fr}}
+.profit-chart-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:clamp(18px,2vw,28px)}
+.profit-stats{display:flex;flex-direction:column;gap:clamp(14px,1.5vw,20px)}
+.profit-stat-box{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:clamp(18px,2vw,28px);text-align:center}
+.profit-stat-box .label{font-size:clamp(.78rem,.9vw,.92rem);color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
+.profit-stat-box .value{font-size:clamp(1.6rem,2.5vw,2.4rem);font-weight:700;color:var(--success)}
+/* Config GUI */
+.cfg-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}
+.cfg-row:last-child{border-bottom:none}
+.cfg-label{font-size:.88rem;color:var(--text);flex:1;margin-right:12px}
+.cfg-input{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:.85rem;width:280px;max-width:50%;outline:none;transition:border-color .2s}
+.cfg-input:focus{border-color:var(--accent)}
+</style>
+</head>
+<body>
+
+<!-- Login overlay (shown when auth required) -->
+<div class="login-overlay hidden" id="login-overlay">
+
+<!-- List-item modal (opened when user clicks an inventory slot) -->
+<div class="modal-overlay hidden" id="list-item-modal" onclick="closeListItemModal(event)">
+    <div class="modal-box" onclick="event.stopPropagation()">
+        <h3>📦 List Item on Auction House</h3>
+        <div class="modal-field">
+            <label>Item</label>
+            <input type="text" id="li-item-name" readonly style="opacity:.7;cursor:default">
+        </div>
+        <div class="modal-field">
+            <label>BIN Price (coins)</label>
+            <input type="number" id="li-price" min="1" placeholder="e.g. 5000000">
+        </div>
+        <div class="modal-field">
+            <label>Duration (hours)</label>
+            <input type="number" id="li-duration" min="1" max="168" value="24">
+        </div>
+        <div class="modal-actions">
+            <button class="btn" style="background:var(--surface);color:var(--text)" onclick="closeListItemModal()">Cancel</button>
+            <button class="btn" style="background:var(--success);color:#000;font-weight:700" onclick="submitListItem()">🏷️ List Item</button>
+        </div>
+    </div>
+</div>
+    <div class="login-container">
+        <div class="login-box">
+            <h2>🔒 Authentication Required</h2>
+            <p>Enter the web panel password to continue.</p>
+            <div class="login-error" id="login-error">Invalid password. Please try again.</div>
+            <input type="password" id="login-password" placeholder="Password" autocomplete="current-password">
+            <button onclick="doLogin()">Login</button>
+            <div class="login-links">
+                <a href="https://discord.gg/pFTGAZGnE4" target="_blank" rel="noopener noreferrer">💬 Discord</a>
+                <a href="https://auctionflipper.bz" target="_blank" rel="noopener noreferrer">🌐 Website</a>
+                <a href="https://github.com/TreXito/frikadellen-baf-121" target="_blank" rel="noopener noreferrer">🐙 GitHub</a>
+            </div>
+        </div>
+        <div class="login-profit-section" id="login-profit-section">
+            <div class="login-profit-stats">
+                <div class="profit-stat-box"><div class="label">Total Profit</div><div class="value" id="login-total-profit">—</div></div>
+                <div class="profit-stat-box"><div class="label">Profit / Hour</div><div class="value" id="login-per-hour">—</div></div>
+                <div class="profit-stat-box"><div class="label">Uptime</div><div class="value" id="login-uptime">—</div></div>
+            </div>
+            <div class="login-profit-chart">
+                <canvas id="login-chart" height="280"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="header">
+    <h1><span>Frikadellen</span> BAF — Control Panel</h1>
+    <div class="links">
+        <div class="theme-picker" id="theme-picker">
+            <button class="theme-btn" onclick="toggleThemeMenu(event)">🎨 Theme</button>
+            <div class="theme-dropdown" id="theme-dropdown">
+                <div class="theme-opt active" data-theme="midnight" onclick="setTheme('midnight')"><span class="theme-swatch" style="background:#6c5ce7"></span>Midnight</div>
+                <div class="theme-opt" data-theme="obsidian" onclick="setTheme('obsidian')"><span class="theme-swatch" style="background:#e74c3c"></span>Obsidian</div>
+                <div class="theme-opt" data-theme="emerald" onclick="setTheme('emerald')"><span class="theme-swatch" style="background:#00b894"></span>Emerald</div>
+                <div class="theme-opt" data-theme="sakura" onclick="setTheme('sakura')"><span class="theme-swatch" style="background:#e84393"></span>Sakura</div>
+                <div class="theme-opt" data-theme="ocean" onclick="setTheme('ocean')"><span class="theme-swatch" style="background:#0984e3"></span>Ocean</div>
+            </div>
+        </div>
+        <a href="https://discord.gg/pFTGAZGnE4" target="_blank" rel="noopener noreferrer">Discord</a>
+        <a href="https://auctionflipper.bz" target="_blank" rel="noopener noreferrer">auctionflipper.bz</a>
+        <a href="https://github.com/TreXito/frikadellen-baf-121" target="_blank" rel="noopener noreferrer">GitHub</a>
+    </div>
+</div>
+
+<div class="main" id="main-content">
+
+<div class="tab-bar">
+    <button class="tab-btn active" onclick="switchTab('controls')">Controls</button>
+    <button class="tab-btn" onclick="switchTab('ah-profit')">AH Profit</button>
+    <button class="tab-btn" onclick="switchTab('bz-profit')">BZ Profit</button>
+    <button class="tab-btn" onclick="switchTab('total-profit')">Total Profit</button>
+    <button class="tab-btn" onclick="switchTab('game-view')">Game View</button>
+    <button class="tab-btn" onclick="switchTab('config')">Config</button>
+</div>
+
+<div class="tab-content active" id="tab-controls">
+
+<!-- Row 1: Status + Controls -->
+<div class="grid">
+    <div class="card">
+        <h2>Status</h2>
+        <div class="status-grid">
+            <div class="status-item"><div class="label">State</div><div class="value" id="s-state">—</div></div>
+            <div class="status-item"><div class="label">Queue</div><div class="value" id="s-queue">—</div></div>
+            <div class="status-item"><div class="label">Account</div><div class="value" id="s-account">—</div></div>
+            <div class="status-item"><div class="label">Purse</div><div class="value" id="s-purse">—</div></div>
+            <div class="status-item"><div class="label">Uptime</div><div class="value" id="s-uptime">—</div></div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Controls</h2>
+        <div style="display:flex;gap:10px;margin-bottom:16px">
+            <button class="btn btn-pause" id="btn-pause" onclick="pauseMacro()">⏸ Pause</button>
+            <button class="btn btn-resume" id="btn-resume" onclick="resumeMacro()">▶ Resume</button>
+            <a class="btn btn-sm btn-download" href="/api/logs/latest" download="latest.log">📥 Download Logs</a>
+        </div>
+        <div style="display:flex;gap:10px;margin-bottom:16px">
+            <button class="btn btn-sm" style="background:var(--accent);color:#fff" onclick="claimPurchases()">📦 Claim Purchases</button>
+            <button class="btn btn-sm" style="background:var(--warn);color:#1a1a1a" onclick="collectBzOrders()">💰 Sell Instantly (BZ)</button>
+            <button class="btn btn-sm" style="background:var(--accent);color:#fff" onclick="claimBzOrders()">📋 Claim BZ Orders</button>
+        </div>
+        <div style="display:flex;gap:10px;margin-bottom:16px">
+            <button class="btn btn-sm" id="btn-disconnect" style="background:#e74c3c;color:#fff" onclick="toggleConnection()">🔌 Disconnect</button>
+            <button class="btn btn-sm" style="background:#c0392b;color:#fff" onclick="killSession()">💀 Kill Session</button>
+        </div>
+        <div class="toggle-row">
+            <span class="toggle-label">Anonymize</span>
+            <label class="toggle"><input type="checkbox" id="tog-anon" onchange="toggleAnonymize(this.checked)"><span class="slider"></span></label>
+        </div>
+    </div>
+</div>
+
+<!-- Row 2: Accounts + Inventory -->
+<div class="grid">
+    <div class="card">
+        <h2>Accounts</h2>
+        <div class="account-list" id="account-list">
+            <p style="color:var(--text-dim);font-size:.85rem">Loading...</p>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Inventory</h2>
+        <div class="inv-grid" id="inv-grid"></div>
+        <div style="margin-top:10px;text-align:center">
+            <button class="btn btn-sm" onclick="sellInventory()">💰 Sell Inventory</button>
+        </div>
+    </div>
+</div>
+
+<!-- Row 3: Active Auctions + Bazaar Orders (side by side) -->
+<div class="grid">
+<div class="card">
+    <h2>Active Auctions</h2>
+    <div id="auction-container">
+        <p class="auction-empty">Loading...</p>
+    </div>
+</div>
+<div class="card">
+    <h2>Bazaar Orders</h2>
+    <div id="bazaar-orders-container">
+        <p class="auction-empty">Loading...</p>
+    </div>
+    <div style="margin-top:8px;text-align:center">
+        <button class="btn btn-sm" id="cancel-all-bz-btn" style="background:var(--danger);font-size:.75rem;padding:4px 12px" onclick="cancelAllBzOrders()">✕ Cancel All Orders</button>
+    </div>
+</div>
+</div>
+
+<!-- Row 4: Chat (full width) -->
+<div class="card">
+    <h2>Chat</h2>
+    <div class="chat-box">
+        <div class="chat-messages" id="chat-messages"></div>
+        <div class="chat-input-row">
+            <input type="text" id="chat-input" placeholder="Type a message or /command..." autocomplete="off">
+            <button onclick="sendChat()">Send</button>
+        </div>
+    </div>
+</div>
+
+</div><!-- tab-controls -->
+
+<div class="tab-content" id="tab-ah-profit">
+    <div class="profit-container">
+        <div class="profit-chart-card">
+            <canvas id="chart-ah" height="400"></canvas>
+        </div>
+        <div class="profit-stats">
+            <div class="profit-stat-box"><div class="label">Profit</div><div class="value" id="ah-profit-total">0</div></div>
+            <div class="profit-stat-box"><div class="label">Uptime</div><div class="value" id="ah-uptime">—</div></div>
+            <div class="profit-stat-box"><div class="label">P/H</div><div class="value" id="ah-per-hour">0</div></div>
+        </div>
+    </div>
+</div>
+
+<div class="tab-content" id="tab-bz-profit">
+    <div class="profit-container">
+        <div class="profit-chart-card">
+            <canvas id="chart-bz" height="400"></canvas>
+        </div>
+        <div class="profit-stats">
+            <div class="profit-stat-box"><div class="label">Profit</div><div class="value" id="bz-profit-total">0</div></div>
+            <div class="profit-stat-box"><div class="label">Uptime</div><div class="value" id="bz-uptime">—</div></div>
+            <div class="profit-stat-box"><div class="label">P/H</div><div class="value" id="bz-per-hour">0</div></div>
+        </div>
+    </div>
+</div>
+
+<div class="tab-content" id="tab-total-profit">
+    <div class="profit-container">
+        <div class="profit-chart-card">
+            <canvas id="chart-total" height="400"></canvas>
+        </div>
+        <div class="profit-stats">
+            <div class="profit-stat-box"><div class="label">Total Profit</div><div class="value" id="total-profit-total">0</div></div>
+            <div class="profit-stat-box"><div class="label">Uptime</div><div class="value" id="total-uptime">—</div></div>
+            <div class="profit-stat-box"><div class="label">P/H</div><div class="value" id="total-per-hour">0</div></div>
+        </div>
+    </div>
+</div>
+
+<div class="tab-content" id="tab-game-view">
+<div class="card">
+<h2>🎮 Game View <span id="gv-status" style="font-size:.75rem;color:var(--text-dim);font-weight:400"></span></h2>
+<div id="gv-info" style="margin-bottom:12px">
+<div class="status-grid" style="grid-template-columns:1fr 1fr 1fr">
+<div class="status-item"><div class="label">Bot State</div><div class="value" id="gv-state">—</div></div>
+<div class="status-item"><div class="label">Window</div><div class="value" id="gv-title">No window open</div></div>
+<div class="status-item"><div class="label">Slots</div><div class="value" id="gv-slot-count">0</div></div>
+</div>
+</div>
+<div id="gv-grid" style="display:grid;gap:4px;margin-top:8px"></div>
+<p id="gv-empty" style="color:var(--text-dim);text-align:center;padding:40px 0">No GUI window is currently open</p>
+</div>
+</div>
+
+<div class="tab-content" id="tab-config">
+    <div id="config-status" style="display:none;margin-bottom:10px;padding:8px 14px;border-radius:6px;font-size:.85rem"></div>
+
+    <!-- Category: General -->
+    <div class="card" style="margin-bottom:16px">
+        <h2>🎮 General</h2>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-ingame_name">Ingame Name(s)</label><input class="cfg-input" id="cfg-ingame_name" placeholder="Account1,Account2"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-multi_switch_time">Account Switch Time (hours)</label><input class="cfg-input" id="cfg-multi_switch_time" type="number" step="0.5" min="0" placeholder="0 = disabled"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-web_gui_port">Web GUI Port</label><input class="cfg-input" id="cfg-web_gui_port" type="number" min="1" max="65535"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-web_gui_password">Web GUI Password</label><input class="cfg-input" id="cfg-web_gui_password" type="text" placeholder="Leave empty to disable"></div>
+        <div class="cfg-row"><label class="cfg-label">Enable Console Input</label><label class="toggle"><input type="checkbox" id="cfg-enable_console_input"><span class="slider"></span></label></div>
+        <div class="cfg-row"><label class="cfg-label">Share Legendary Flips</label><label class="toggle"><input type="checkbox" id="cfg-share_legendary_flips"><span class="slider"></span></label></div>
+    </div>
+
+    <!-- Category: Timing & Delays -->
+    <div class="card" style="margin-bottom:16px">
+        <h2>⏱️ Timing &amp; Delays</h2>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-command_delay_ms">Command Delay (ms)</label><input class="cfg-input" id="cfg-command_delay_ms" type="number" min="100"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-bed_spam_click_delay">Bed Spam Click Delay (ms)</label><input class="cfg-input" id="cfg-bed_spam_click_delay" type="number" min="10"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-bed_multiple_clicks_delay">Bed Multiple Clicks Delay (ms)</label><input class="cfg-input" id="cfg-bed_multiple_clicks_delay" type="number" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-bed_pre_click_ms">Bed Pre-Click (ms)</label><input class="cfg-input" id="cfg-bed_pre_click_ms" type="number" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label">Bed Spam</label><label class="toggle"><input type="checkbox" id="cfg-bed_spam"><span class="slider"></span></label></div>
+    </div>
+
+    <!-- Category: Auction House -->
+    <div class="card" style="margin-bottom:16px">
+        <h2>🏛️ Auction House</h2>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-auction_duration_hours">Auction Duration (hours)</label><input class="cfg-input" id="cfg-auction_duration_hours" type="number" min="1" max="48"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-auction_listing_delay_ms">Auction Listing Delay (ms)</label><input class="cfg-input" id="cfg-auction_listing_delay_ms" type="number" min="500"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-max_items_in_inventory">Max Flip Items in Inventory</label><input class="cfg-input" id="cfg-max_items_in_inventory" type="number" min="0" max="28"></div>
+    </div>
+
+    <!-- Category: Bazaar -->
+    <div class="card" style="margin-bottom:16px">
+        <h2>📦 Bazaar</h2>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-bazaar_order_check_interval_seconds">Order Check Interval (seconds)</label><input class="cfg-input" id="cfg-bazaar_order_check_interval_seconds" type="number" min="10"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-bazaar_order_cancel_minutes_per_million">Cancel Minutes Per Million</label><input class="cfg-input" id="cfg-bazaar_order_cancel_minutes_per_million" type="number" min="1"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-bazaar_tax_rate">Tax Rate (%)</label><input class="cfg-input" id="cfg-bazaar_tax_rate" type="number" step="0.05" min="0" max="5"></div>
+    </div>
+
+    <!-- Category: Humanization -->
+    <div class="card" style="margin-bottom:16px">
+        <h2>😴 Humanization / Rest Breaks</h2>
+        <p style="color:var(--text-dim);font-size:.82rem;margin-bottom:12px">When enabled, the bot will periodically take random breaks to appear more human-like. Session time is preserved.</p>
+        <div class="cfg-row"><label class="cfg-label">Enable Rest Breaks</label><label class="toggle"><input type="checkbox" id="cfg-humanization_enabled"><span class="slider"></span></label></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-humanization_min_interval_minutes">Min Interval (minutes)</label><input class="cfg-input" id="cfg-humanization_min_interval_minutes" type="number" min="5"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-humanization_max_interval_minutes">Max Interval (minutes)</label><input class="cfg-input" id="cfg-humanization_max_interval_minutes" type="number" min="10"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-humanization_min_break_minutes">Min Break Duration (minutes)</label><input class="cfg-input" id="cfg-humanization_min_break_minutes" type="number" min="1"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-humanization_max_break_minutes">Max Break Duration (minutes)</label><input class="cfg-input" id="cfg-humanization_max_break_minutes" type="number" min="1"></div>
+    </div>
+
+    <!-- Category: Webhooks -->
+    <div class="card" style="margin-bottom:16px">
+        <h2>🔔 Webhooks &amp; Notifications</h2>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-webhook_url">Discord Webhook URL</label><input class="cfg-input" id="cfg-webhook_url" type="url" placeholder="https://discord.com/api/webhooks/..."></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-bazaar_webhook_url">Bazaar Webhook URL</label><input class="cfg-input" id="cfg-bazaar_webhook_url" type="url" placeholder="Optional — falls back to main webhook"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-discord_id">Discord User ID (for pings)</label><input class="cfg-input" id="cfg-discord_id" placeholder="e.g. 123456789012345678"></div>
+    </div>
+
+    <!-- Category: Proxy -->
+    <div class="card" style="margin-bottom:16px">
+        <h2>🌐 Proxy</h2>
+        <div class="cfg-row"><label class="cfg-label">Proxy Enabled</label><label class="toggle"><input type="checkbox" id="cfg-proxy_enabled"><span class="slider"></span></label></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-proxy_address">Proxy Address</label><input class="cfg-input" id="cfg-proxy_address" placeholder="host:port"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-proxy_credentials">Proxy Credentials</label><input class="cfg-input" id="cfg-proxy_credentials" placeholder="username:password"></div>
+    </div>
+
+    <!-- Category: Advanced -->
+    <div class="card" style="margin-bottom:16px">
+        <h2>⚙️ Advanced</h2>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-websocket_url">WebSocket URL</label><input class="cfg-input" id="cfg-websocket_url" placeholder="wss://sky.coflnet.com/modsocket"></div>
+        <div class="cfg-row"><label class="cfg-label">Use COFL Chat</label><label class="toggle"><input type="checkbox" id="cfg-use_cofl_chat"><span class="slider"></span></label></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-auto_cookie">Auto Cookie (0 = disabled)</label><input class="cfg-input" id="cfg-auto_cookie" type="number" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-hypixel_api_key">Hypixel API Key</label><input class="cfg-input" id="cfg-hypixel_api_key" placeholder="Optional"></div>
+    </div>
+
+    <!-- Raw TOML (collapsed) -->
+    <details class="card" style="margin-bottom:16px">
+        <summary style="cursor:pointer;color:var(--text-dim);font-size:.85rem">📝 Raw Config (TOML)</summary>
+        <textarea id="config-editor" spellcheck="false" style="width:100%;min-height:300px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:14px;font-family:'JetBrains Mono','Fira Code',monospace;font-size:.82rem;line-height:1.6;resize:vertical;outline:none;tab-size:4;margin-top:10px" placeholder="Loading config..."></textarea>
+    </details>
+
+    <div style="display:flex;gap:10px;margin-bottom:20px">
+        <button class="btn" style="background:var(--accent);color:#fff" onclick="saveConfigGUI()">💾 Save Config</button>
+        <button class="btn btn-sm" style="background:var(--surface);color:var(--text);border:1px solid var(--border)" onclick="loadConfig()">🔄 Reload</button>
+    </div>
+</div>
+
+</div><!-- .main -->
+
+<script>
+// ── Helpers ──────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+
+function escapeHtml(str) {
+    const d = document.createElement('div');
+    d.textContent = str;
+    return d.innerHTML;
+}
+
+function formatCoins(n) {
+    if (n == null) return '—';
+    return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+function formatUptime(secs) {
+    if (secs == null) return '—';
+    const d = Math.floor(secs / 86400);
+    const h = Math.floor((secs % 86400) / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = secs % 60;
+    if (d > 0) return d + 'd ' + h + 'h ' + m + 'm';
+    if (h > 0) return h + 'h ' + m + 'm ' + s + 's';
+    return m + 'm ' + s + 's';
+}
+
+/** Convert Minecraft §-codes to HTML spans */
+function mcToHtml(text) {
+    let result = '';
+    let open = 0;
+    const codeMap = {
+        '0':'mc-0','1':'mc-1','2':'mc-2','3':'mc-3','4':'mc-4','5':'mc-5',
+        '6':'mc-6','7':'mc-7','8':'mc-8','9':'mc-9','a':'mc-a','b':'mc-b',
+        'c':'mc-c','d':'mc-d','e':'mc-e','f':'mc-f','l':'mc-l','m':'mc-m',
+        'n':'mc-n','o':'mc-o'
+    };
+    let i = 0;
+    while (i < text.length) {
+        if (text[i] === '§' && i + 1 < text.length) {
+            const code = text[i+1].toLowerCase();
+            if (code === 'r') {
+                for (let j = 0; j < open; j++) result += '</span>';
+                open = 0;
+            } else if (codeMap[code]) {
+                result += '<span class="' + codeMap[code] + '">';
+                open++;
+            }
+            i += 2;
+        } else {
+            const c = text[i];
+            if (c === '<') result += '&lt;';
+            else if (c === '>') result += '&gt;';
+            else if (c === '&') result += '&amp;';
+            else result += c;
+            i++;
+        }
+    }
+    for (let j = 0; j < open; j++) result += '</span>';
+    return result;
+}
+
+/** Strip §-codes for plain text */
+function stripMC(text) {
+    return text.replace(/§[0-9a-fk-or]/gi, '');
+}
+
+// ── Auth state ───────────────────────────────────────────────
+let needsAuth = false;
+
+async function doLogin() {
+    const pw = $('login-password').value;
+    if (!pw) return;
+    try {
+        const r = await fetch('/api/login', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({password: pw})
+        });
+        const d = await r.json();
+        if (d.success) {
+            $('login-overlay').classList.add('hidden');
+            $('login-error').style.display = 'none';
+            needsAuth = false;
+            fetchStatus();
+            fetchInventory();
+            connectChat();
+        } else {
+            $('login-error').style.display = 'block';
+        }
+    } catch(e) {
+        $('login-error').style.display = 'block';
+    }
+}
+
+$('login-password').addEventListener('keydown', e => {
+    if (e.key === 'Enter') doLogin();
+});
+
+function showLoginOverlay() {
+    if (!needsAuth) {
+        needsAuth = true;
+        $('login-overlay').classList.remove('hidden');
+        $('login-password').focus();
+        fetchLoginProfit();
+    }
+}
+
+// ── Login page profit display (public, no auth needed) ──────
+let loginChart = null;
+
+async function fetchLoginProfit() {
+    try {
+        const r = await fetch('/api/profit/public');
+        if (!r.ok) return;
+        const d = await r.json();
+        const el = (id) => document.getElementById(id);
+        if (el('login-total-profit')) el('login-total-profit').textContent = formatProfitLabel(d.total);
+        if (el('login-per-hour')) el('login-per-hour').textContent = formatProfitLabel(d.per_hour);
+        if (el('login-uptime')) el('login-uptime').textContent = formatUptime(d.uptime_seconds);
+
+        // Render total profit chart on the login page
+        const canvas = el('login-chart');
+        if (canvas && d.ah_points && d.bz_points) {
+            if (loginChart) loginChart.destroy();
+            loginChart = new Chart(canvas, makeTotalChartConfig(d.ah_points, d.bz_points));
+        }
+    } catch(e) { console.error('Login profit fetch failed', e); }
+}
+
+// Refresh login profit every 15s while overlay is visible
+setInterval(() => {
+    if (needsAuth) fetchLoginProfit();
+}, 15000);
+
+// ── State ────────────────────────────────────────────────────
+let accounts = [];
+let currentAccountIndex = 0;
+let isAnonymized = false;
+
+// ── API calls ────────────────────────────────────────────────
+async function fetchStatus() {
+    try {
+        const r = await fetch('/api/status');
+        if (r.status === 401) { showLoginOverlay(); return; }
+        const d = await r.json();
+        $('s-state').textContent = d.state;
+        $('s-queue').textContent = d.queue_depth;
+        $('s-account').textContent = d.current_account || '—';
+        $('s-purse').textContent = formatCoins(d.purse);
+        $('s-uptime').textContent = formatUptime(d.uptime_seconds);
+        $('tog-anon').checked = d.anonymize_webhook_name;
+        isAnonymized = d.anonymize_webhook_name;
+        $('btn-pause').style.display = d.macro_paused ? 'none' : '';
+        $('btn-resume').style.display = d.macro_paused ? '' : 'none';
+        accounts = d.accounts || [];
+        currentAccountIndex = d.current_account_index || 0;
+        renderAccounts();
+    } catch(e) { console.error('Status fetch failed', e); }
+}
+
+function renderAccounts() {
+    const list = $('account-list');
+    list.innerHTML = '';
+    if (accounts.length === 0) {
+        list.innerHTML = '<p style="color:var(--text-dim);font-size:.85rem">No accounts configured</p>';
+        return;
+    }
+    accounts.forEach((name, idx) => {
+        const div = document.createElement('div');
+        div.className = 'account-item' + (idx === currentAccountIndex ? ' active' : '');
+        div.onclick = () => switchAccount(idx);
+        const img = document.createElement('img');
+        img.className = 'account-head';
+        img.src = isAnonymized
+            ? 'https://mc-heads.net/avatar/MHF_Question/32'
+            : 'https://mc-heads.net/avatar/' + encodeURIComponent(name) + '/32';
+        img.alt = isAnonymized ? 'Hidden' : name;
+        img.loading = 'lazy';
+        const info = document.createElement('div');
+        info.className = 'account-info';
+        const nameEl = document.createElement('div');
+        nameEl.className = 'account-name';
+        nameEl.textContent = name;
+        info.appendChild(nameEl);
+        if (idx === currentAccountIndex) {
+            const badge = document.createElement('div');
+            badge.className = 'account-badge';
+            badge.textContent = 'Active';
+            info.appendChild(badge);
+        }
+        div.appendChild(img);
+        div.appendChild(info);
+        list.appendChild(div);
+    });
+}
+
+async function pauseMacro() { await fetch('/api/pause', {method:'POST'}); fetchStatus(); }
+async function resumeMacro() { await fetch('/api/resume', {method:'POST'}); fetchStatus(); }
+
+async function toggleAnonymize(enabled) {
+    await fetch('/api/toggle_anonymize', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})});
+}
+
+async function switchAccount(index) {
+    if (accounts.length <= 1) return;
+    if (index === currentAccountIndex) return;
+    if (!confirm('Switch to ' + accounts[index] + '? The process will restart.')) return;
+    await fetch('/api/switch_account', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({index})});
+}
+
+async function sellInventory() {
+    if (!confirm('Sell all sellable items in your inventory?')) return;
+    await fetch('/api/chat/send', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:'/cofl sellinventory'})});
+}
+
+async function cancelAuction(itemName, startingBid) {
+    if (!confirm('Cancel auction for "' + itemName + '"?')) return;
+    await fetch('/api/cancel_auction', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({item_name: itemName, starting_bid: startingBid})});
+}
+
+async function claimPurchases() {
+    if (!confirm('Check and claim unclaimed purchases?')) return;
+    await fetch('/api/claim_purchases', {method:'POST'});
+}
+
+async function collectBzOrders() {
+    if (!confirm('Sell entire inventory instantly on the Bazaar?')) return;
+    await fetch('/api/collect_bz_orders', {method:'POST'});
+}
+
+async function claimBzOrders() {
+    if (!confirm('Force check and claim filled bazaar orders?')) return;
+    await fetch('/api/claim_bz_orders', {method:'POST'});
+}
+
+async function cancelBzOrder(itemName, isBuyOrder) {
+    const orderType = isBuyOrder ? 'BUY' : 'SELL';
+    if (!confirm('Cancel ' + orderType + ' order for "' + itemName + '"?')) return;
+    await fetch('/api/cancel_bz_order', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({item_name: itemName, is_buy_order: isBuyOrder})});
+    fetchBazaarOrders();
+}
+
+async function cancelAllBzOrders() {
+    if (!confirm('Cancel ALL bazaar orders?')) return;
+    await fetch('/api/cancel_all_bz_orders', {method:'POST'});
+    fetchBazaarOrders();
+}
+
+let isDisconnected = false;
+
+async function toggleConnection() {
+    const btn = document.getElementById('btn-disconnect');
+    if (!isDisconnected) {
+        if (!confirm('Disconnect from Hypixel and COFL WebSocket?')) return;
+        await fetch('/api/disconnect', {method:'POST'});
+        isDisconnected = true;
+        btn.textContent = '🔗 Connect';
+        btn.style.background = '#27ae60';
+    } else {
+        if (!confirm('Reconnect? This will restart the process.')) return;
+        await fetch('/api/connect', {method:'POST'});
+        isDisconnected = false;
+        btn.textContent = '🔌 Disconnect';
+        btn.style.background = '#e74c3c';
+    }
+}
+
+async function killSession() {
+    if (!confirm('Kill the bot session? The process will terminate immediately.')) return;
+    await fetch('/api/kill_session', {method:'POST'});
+}
+
+async function fetchInventory() {
+    try {
+        const r = await fetch('/api/inventory');
+        if (r.status === 401) return;
+        const d = await r.json();
+        renderInventory(d);
+    } catch(e) { console.error('Inventory fetch failed', e); }
+}
+
+async function fetchAuctions() {
+    try {
+        const r = await fetch('/api/auctions');
+        if (r.status === 401) return;
+        const d = await r.json();
+        renderAuctions(Array.isArray(d) ? d : []);
+    } catch(e) { console.error('Auctions fetch failed', e); }
+}
+
+async function fetchBazaarOrders() {
+    try {
+        const r = await fetch('/api/bazaar_orders');
+        if (r.status === 401) return;
+        const d = await r.json();
+        renderBazaarOrders(Array.isArray(d) ? d : []);
+    } catch(e) { console.error('Bazaar orders fetch failed', e); }
+}
+
+/** Format seconds remaining into a human-readable string */
+function formatTimeRemaining(secs) {
+    if (secs <= 0) return 'Expired';
+    const d = Math.floor(secs / 86400);
+    const h = Math.floor((secs % 86400) / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    if (d > 0) return d + 'd ' + h + 'h';
+    if (h > 0) return h + 'h ' + m + 'm';
+    return m + 'm ' + (secs % 60) + 's';
+}
+
+function renderAuctions(auctions) {
+    const container = $('auction-container');
+    if (auctions.length === 0) {
+        container.innerHTML = '<p class="auction-empty">No active auctions</p>';
+        return;
+    }
+    const table = document.createElement('table');
+    table.className = 'auction-table';
+    table.innerHTML = '<thead><tr><th></th><th>Item</th><th>Price</th><th>Time Left</th><th></th></tr></thead>';
+    const tbody = document.createElement('tbody');
+    auctions.forEach(a => {
+        const tr = document.createElement('tr');
+        tr.style.position = 'relative';
+        const iconUrl = a.tag
+            ? 'https://sky.coflnet.com/static/icon/' + encodeURIComponent(a.tag)
+            : null;
+        const bid = a.highest_bid > 0 ? a.highest_bid : a.starting_bid;
+        const urgent = a.time_remaining_seconds < 3600;
+        const escapedName = escapeHtml(a.item_name);
+        tr.innerHTML =
+            '<td style="width:36px">' +
+                (iconUrl ? '<img class="auction-icon" src="' + iconUrl + '" alt="' + escapedName + '" loading="lazy" onerror="this.style.display=\'none\'">' : '') +
+            '</td>' +
+            '<td>' + escapedName + '</td>' +
+            '<td class="auction-bid"><span title="coins">' + bid.toLocaleString() + ' ✦</span></td>' +
+            '<td class="auction-time' + (urgent ? ' urgent' : '') + '">' + formatTimeRemaining(a.time_remaining_seconds) + '</td>' +
+            '<td></td>';
+        // Create cancel button via DOM to avoid XSS
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'btn btn-sm';
+        cancelBtn.style.cssText = 'background:var(--danger);font-size:.7rem;padding:3px 8px';
+        cancelBtn.textContent = '✕ Cancel';
+        cancelBtn.addEventListener('click', () => cancelAuction(a.item_name, a.starting_bid || 0));
+        tr.lastElementChild.appendChild(cancelBtn);
+        // Add lore tooltip if available
+        if (a.lore && a.lore.length > 0) {
+            const tip = document.createElement('div');
+            tip.className = 'tooltip';
+            const titleEl = document.createElement('div');
+            titleEl.className = 'tip-title';
+            titleEl.innerHTML = mcToHtml(a.item_name_colored || a.item_name);
+            tip.appendChild(titleEl);
+            const loreEl = document.createElement('div');
+            loreEl.className = 'tip-lore';
+            loreEl.innerHTML = a.lore.map(l => mcToHtml(l)).join('<br>');
+            tip.appendChild(loreEl);
+            // Attach tooltip to the item name cell (second td)
+            const nameCell = tr.querySelectorAll('td')[1];
+            if (nameCell) {
+                nameCell.style.position = 'relative';
+                nameCell.appendChild(tip);
+                nameCell.addEventListener('mouseenter', e => positionTooltip(tip, e));
+                nameCell.addEventListener('mousemove', e => positionTooltip(tip, e));
+                nameCell.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+            }
+        }
+        tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    container.innerHTML = '';
+    container.appendChild(table);
+    // Total unsold bar
+    let totalUnsold = 0;
+    auctions.forEach(a => {
+        const bid = a.highest_bid > 0 ? a.highest_bid : a.starting_bid;
+        totalUnsold += bid;
+    });
+    const totalBar = document.createElement('div');
+    totalBar.style.cssText = 'text-align:right;padding:6px 10px;font-size:.85rem;color:var(--text-dim);border-top:1px solid var(--border)';
+    totalBar.innerHTML = '<strong>Total unsold:</strong> ' + totalUnsold.toLocaleString() + ' ✦';
+    container.appendChild(totalBar);
+}
+
+function renderBazaarOrders(orders) {
+    const container = $('bazaar-orders-container');
+    if (orders.length === 0) {
+        container.innerHTML = '<p class="auction-empty">No active bazaar orders</p>';
+        return;
+    }
+    const table = document.createElement('table');
+    table.className = 'auction-table';
+    table.innerHTML = '<thead><tr><th>Type</th><th>Item</th><th>Qty</th><th>Price/u</th><th>Total</th><th>Status</th><th></th></tr></thead>';
+    const tbody = document.createElement('tbody');
+    orders.forEach(o => {
+        const tr = document.createElement('tr');
+        const isBuy = o.is_buy_order;
+        const total = o.price_per_unit * o.amount;
+        const statusClass = o.status === 'filled' ? ' style="color:var(--success)"' : '';
+        const statusLabel = o.status === 'filled' ? '✅ Filled' : '⏳ Open';
+        const typeLabel = isBuy
+            ? '<span style="color:var(--success);font-weight:700">BUY</span>'
+            : '<span style="color:var(--danger);font-weight:700">SELL</span>';
+        const age = o.placed_at ? formatTimeAge(o.placed_at) : '';
+        const escapedName = escapeHtml(o.item_name);
+        tr.innerHTML =
+            '<td>' + typeLabel + '</td>' +
+            '<td>' + escapedName + '</td>' +
+            '<td>' + o.amount + '</td>' +
+            '<td class="auction-bid">' + formatShortCoins(o.price_per_unit) + '</td>' +
+            '<td class="auction-bid">' + formatShortCoins(total) + '</td>' +
+            '<td' + statusClass + '>' + statusLabel + (age ? ' <span style="color:var(--text-dim);font-size:.72rem">(' + age + ')</span>' : '') + '</td>' +
+            '<td></td>';
+        // Create cancel button via DOM to avoid XSS
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'btn btn-sm';
+        cancelBtn.style.cssText = 'background:var(--danger);font-size:.7rem;padding:3px 8px';
+        cancelBtn.textContent = '✕ Cancel';
+        cancelBtn.addEventListener('click', () => cancelBzOrder(o.item_name, o.is_buy_order));
+        tr.lastElementChild.appendChild(cancelBtn);
+        tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    container.innerHTML = '';
+    container.appendChild(table);
+    // Total orders value bar (buy + sell totals)
+    let totalBuy = 0, totalSell = 0;
+    orders.forEach(o => {
+        const val = o.price_per_unit * o.amount;
+        if (o.is_buy_order) totalBuy += val; else totalSell += val;
+    });
+    const totalBar = document.createElement('div');
+    totalBar.style.cssText = 'text-align:right;padding:6px 10px;font-size:.85rem;color:var(--text-dim);border-top:1px solid var(--border)';
+    const parts = [];
+    if (totalBuy > 0) parts.push('<span style="color:var(--success)">Buy: ' + formatShortCoins(totalBuy) + '</span>');
+    if (totalSell > 0) parts.push('<span style="color:var(--danger)">Sell: ' + formatShortCoins(totalSell) + '</span>');
+    totalBar.innerHTML = '<strong>Total:</strong> ' + parts.join(' · ');
+    container.appendChild(totalBar);
+}
+
+function formatTimeAge(unixSecs) {
+    const now = Math.floor(Date.now() / 1000);
+    const diff = now - unixSecs;
+    if (diff < 0) return 'just now';
+    if (diff < 60) return diff + 's ago';
+    if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+    return Math.floor(diff / 3600) + 'h ago';
+}
+
+function formatShortCoins(n) {
+    if (typeof n !== 'number' || isNaN(n)) return '0';
+    if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+    return n.toLocaleString();
+}
+
+/** Map stained glass pane / glass pane registry names to CSS colors */
+const GLASS_PANE_COLORS = {
+    'black_stained_glass_pane': '#1d1d21', 'white_stained_glass_pane': '#f9fffe',
+    'orange_stained_glass_pane': '#f9801d', 'magenta_stained_glass_pane': '#c74ebd',
+    'light_blue_stained_glass_pane': '#3ab3da', 'yellow_stained_glass_pane': '#fed83d',
+    'lime_stained_glass_pane': '#80c71f', 'pink_stained_glass_pane': '#f38baa',
+    'gray_stained_glass_pane': '#474f52', 'light_gray_stained_glass_pane': '#9d9d97',
+    'cyan_stained_glass_pane': '#169c9c', 'purple_stained_glass_pane': '#8932b8',
+    'blue_stained_glass_pane': '#3c44aa', 'brown_stained_glass_pane': '#835432',
+    'green_stained_glass_pane': '#5e7c16', 'red_stained_glass_pane': '#b02e26',
+    'glass_pane': '#c0d8e0',
+};
+
+/** Get a data-URI for a colored glass pane, or null */
+function getGlassPaneDataUrl(registryName) {
+    const name = (registryName || '').replace('minecraft:', '');
+    const color = GLASS_PANE_COLORS[name];
+    if (!color || !/^#[0-9a-fA-F]{6}$/.test(color)) return null;
+    // Return a tiny inline SVG rectangle
+    return "data:image/svg+xml," + encodeURIComponent(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16">'
+        + '<rect width="16" height="16" rx="2" fill="' + color + '" opacity="0.85"/>'
+        + '<rect x="1" y="1" width="14" height="14" rx="1" fill="' + color + '"/>'
+        + '</svg>'
+    );
+}
+
+/** Get the CSS color for a glass pane registry name, or null */
+function getGlassPaneColor(registryName) {
+    const name = (registryName || '').replace('minecraft:', '');
+    return GLASS_PANE_COLORS[name] || null;
+}
+
+/** Get an icon URL for an inventory item */
+function getItemIconUrl(slot) {
+    // Glass panes: render as colored squares
+    if (slot.name) {
+        const paneUrl = getGlassPaneDataUrl(slot.name);
+        if (paneUrl) return paneUrl;
+    }
+    // SkyBlock items: use Coflnet icon by tag
+    if (slot.tag) {
+        return 'https://sky.coflnet.com/static/icon/' + encodeURIComponent(slot.tag);
+    }
+    // Fallback: derive tag from display name (e.g. "Aspect of the End" → "ASPECT_OF_THE_END")
+    if (slot.displayName) {
+        const clean = slot.displayName.replace(/§[0-9a-fk-or]/gi, '').trim();
+        if (clean && clean !== '?') {
+            const derived = clean.replace(/[^a-zA-Z0-9]/g, '_').toUpperCase().replace(/^_+|_+$/g, '');
+            if (derived) {
+                return 'https://sky.coflnet.com/static/icon/' + encodeURIComponent(derived);
+            }
+        }
+    }
+    // Vanilla items: use minecraft registry name (strip "minecraft:" prefix)
+    if (slot.name) {
+        const name = slot.name.replace('minecraft:', '');
+        return 'https://mc-heads.net/item/' + encodeURIComponent(name);
+    }
+    return null;
+}
+
+function renderInventory(inv) {
+    const grid = $('inv-grid');
+    grid.innerHTML = '';
+    const slots = inv.slots || [];
+    for (let i = 9; i < 45; i++) {
+        const slot = slots[i];
+        const div = document.createElement('div');
+        div.className = 'inv-slot' + (slot ? ' has-item' : '');
+        if (slot) {
+            const name = slot.displayName || slot.name || '?';
+            const iconUrl = getItemIconUrl(slot);
+            if (iconUrl) {
+                const img = document.createElement('img');
+                img.className = 'item-icon';
+                img.src = iconUrl;
+                img.alt = stripMC(name);
+                img.loading = 'lazy';
+                img.onerror = function() {
+                    this.style.display = 'none';
+                    this.parentElement.textContent = stripMC(name).substring(0, 8);
+                };
+                div.appendChild(img);
+            } else {
+                div.textContent = stripMC(name).substring(0, 8);
+            }
+            if (slot.count > 1) {
+                const countEl = document.createElement('span');
+                countEl.className = 'count';
+                countEl.textContent = slot.count;
+                div.appendChild(countEl);
+            }
+            const tip = document.createElement('div');
+            tip.className = 'tooltip';
+            const titleEl = document.createElement('div');
+            titleEl.className = 'tip-title';
+            titleEl.innerHTML = mcToHtml(slot.displayNameColored || name) + (slot.count > 1 ? ' x' + slot.count : '');
+            tip.appendChild(titleEl);
+            if (slot.lore && slot.lore.length > 0) {
+                const loreEl = document.createElement('div');
+                loreEl.className = 'tip-lore';
+                loreEl.innerHTML = slot.lore.map(l => mcToHtml(l)).join('<br>');
+                tip.appendChild(loreEl);
+            }
+            div.appendChild(tip);
+            div.addEventListener('mouseenter', e => positionTooltip(tip, e));
+            div.addEventListener('mousemove', e => positionTooltip(tip, e));
+            div.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+            // Click to open list-item modal
+            const slotIndex = i;
+            div.addEventListener('click', () => openListItemModal(slot, slotIndex));
+        }
+        grid.appendChild(div);
+    }
+}
+
+// ── List-item modal ───────────────────────────────────────────
+let _listItemSlot = null;
+
+function openListItemModal(slot, slotIndex) {
+    const name = stripMC(slot.displayName || slot.name || '?');
+    _listItemSlot = { slot, index: slotIndex };
+    $('li-item-name').value = name;
+    $('li-price').value = '';
+    $('li-duration').value = '24';
+    $('list-item-modal').classList.remove('hidden');
+    setTimeout(() => $('li-price').focus(), 50);
+}
+
+function closeListItemModal(evt) {
+    // When called from the backdrop onclick, only close if the click landed on
+    // the overlay itself (not a child element).  The modal-box uses
+    // stopPropagation so clicks inside it never reach here, but using
+    // currentTarget === target is the standard guard for this pattern.
+    if (evt && evt.currentTarget !== evt.target) return;
+    $('list-item-modal').classList.add('hidden');
+    _listItemSlot = null;
+}
+
+async function submitListItem() {
+    if (!_listItemSlot) return;
+    const priceRaw = $('li-price').value.trim().replace(/[,_]/g, '');
+    const price = parseInt(priceRaw, 10);
+    const duration = parseInt($('li-duration').value, 10) || 24;
+    if (!price || price <= 0) { alert('Please enter a valid price.'); return; }
+    const itemName = $('li-item-name').value;
+    const itemSlot = _listItemSlot.index;
+    $('list-item-modal').classList.add('hidden');
+    _listItemSlot = null;
+    try {
+        const r = await fetch('/api/list_item', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ item_name: itemName, item_slot: itemSlot, starting_bid: price, duration_hours: duration })
+        });
+        if (!r.ok) {
+            const txt = await r.text();
+            alert('Failed to queue listing: ' + txt);
+        }
+    } catch(e) { alert('Request failed: ' + e); }
+}
+
+// ── Chat WebSocket ───────────────────────────────────────────
+let chatWs = null;
+function connectChat() {
+    if (needsAuth) return;
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    chatWs = new WebSocket(proto + '//' + location.host + '/api/chat/ws');
+    chatWs.onmessage = (e) => {
+        appendChat(e.data);
+    };
+    chatWs.onclose = () => {
+        setTimeout(connectChat, 2000);
+    };
+    chatWs.onerror = () => {
+        chatWs.close();
+    };
+}
+
+function appendChat(text) {
+    const box = $('chat-messages');
+    const div = document.createElement('div');
+    div.className = 'msg';
+    div.innerHTML = mcToHtml(text);
+    box.appendChild(div);
+    while (box.children.length > 500) box.removeChild(box.firstChild);
+    box.scrollTop = box.scrollHeight;
+}
+
+function sendChat() {
+    const input = $('chat-input');
+    const msg = input.value.trim();
+    if (!msg) return;
+    if (chatWs && chatWs.readyState === WebSocket.OPEN) {
+        chatWs.send(msg);
+    } else {
+        fetch('/api/chat/send', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:msg})});
+    }
+    input.value = '';
+    input.focus();
+}
+
+$('chat-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') sendChat();
+});
+
+// ── Smart Tooltip Positioning (SkyCrypt-style: top-down) ─────
+function positionTooltip(tip, e) {
+    tip.style.display = 'block';
+    const pad = 12;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const tw = tip.offsetWidth;
+    const th = tip.offsetHeight;
+    // Prefer below-right of cursor
+    let left = e.clientX + pad;
+    let top = e.clientY + pad;
+    // If tooltip goes off right edge, flip to left of cursor
+    if (left + tw > vw - pad) left = e.clientX - tw - pad;
+    // If tooltip goes off bottom edge, show above cursor
+    if (top + th > vh - pad) top = e.clientY - th - pad;
+    // Clamp to viewport
+    if (left < pad) left = pad;
+    if (top < pad) top = pad;
+    tip.style.left = left + 'px';
+    tip.style.top = top + 'px';
+}
+
+// ── Theme Switching ──────────────────────────────────────────
+const THEMES = ['midnight','obsidian','emerald','sakura','ocean'];
+
+function setTheme(name) {
+    document.documentElement.setAttribute('data-theme', name);
+    localStorage.setItem('baf-theme', name);
+    document.querySelectorAll('.theme-opt').forEach(el => {
+        el.classList.toggle('active', el.dataset.theme === name);
+    });
+    closeThemeMenu();
+}
+
+function toggleThemeMenu(e) {
+    e.stopPropagation();
+    $('theme-picker').classList.toggle('open');
+}
+
+function closeThemeMenu() {
+    $('theme-picker').classList.remove('open');
+}
+
+document.addEventListener('click', e => {
+    if (!$('theme-picker').contains(e.target)) closeThemeMenu();
+});
+
+// Close list-item modal on Escape, submit on Enter
+document.addEventListener('keydown', e => {
+    const modal = $('list-item-modal');
+    if (!modal || modal.classList.contains('hidden')) return;
+    if (e.key === 'Escape') { closeListItemModal(); }
+    else if (e.key === 'Enter') { submitListItem(); }
+});
+
+// Restore saved theme
+(function() {
+    const saved = localStorage.getItem('baf-theme');
+    if (saved && THEMES.includes(saved)) setTheme(saved);
+})();
+
+// ── Tabs ─────────────────────────────────────────────────────
+function switchTab(tabId) {
+    document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+    const tab = document.getElementById('tab-' + tabId);
+    if (tab) tab.classList.add('active');
+    const buttons = document.querySelectorAll('.tab-btn');
+    const map = {'controls':0,'ah-profit':1,'bz-profit':2,'total-profit':3,'game-view':4,'config':5};
+    if (map[tabId] !== undefined && buttons[map[tabId]]) buttons[map[tabId]].classList.add('active');
+    if (tabId === 'config') loadConfig();
+    if (tabId === 'game-view') startGameView(); else stopGameView();
+    if (tabId !== 'controls' && tabId !== 'config' && tabId !== 'game-view') fetchProfit();
+}
+
+// ── Game View ────────────────────────────────────────────────
+let gvInterval=null;
+function startGameView(){if(gvInterval)return;fetchGameView();gvInterval=setInterval(fetchGameView,500)}
+function stopGameView(){if(gvInterval){clearInterval(gvInterval);gvInterval=null}}
+
+function fetchGameView(){
+    fetch('/api/game-view').then(r=>r.json()).then(renderGameView).catch(()=>{});
+}
+
+function renderGameView(data){
+    const stateEl=$('gv-state');
+    const titleEl=$('gv-title');
+    const countEl=$('gv-slot-count');
+    const grid=$('gv-grid');
+    const empty=$('gv-empty');
+    const status=$('gv-status');
+
+    if(!stateEl)return;
+    stateEl.textContent=data.botState||'—';
+    status.textContent='(live)';
+
+    if(!data.open){
+        titleEl.textContent='No window open';
+        countEl.textContent='0';
+        grid.innerHTML='';
+        grid.style.display='none';
+        empty.style.display='block';
+        return;
+    }
+
+    titleEl.textContent=data.title||'Unknown';
+    countEl.textContent=String(data.slotCount||data.slots.length);
+    empty.style.display='none';
+    grid.style.display='grid';
+
+    // Calculate columns: try to make it 9-wide (standard chest)
+    const total=data.slots.length;
+    const cols=total<=9?total:9;
+    grid.style.gridTemplateColumns='repeat('+cols+',1fr)';
+
+    grid.innerHTML='';
+    for(const s of data.slots){
+        const div=document.createElement('div');
+        div.className='gv-slot'+(s.empty?'':' has-item');
+
+        // Slot number
+        const numEl=document.createElement('span');
+        numEl.className='slot-num';
+        numEl.textContent=s.slot;
+        div.appendChild(numEl);
+
+        if(!s.empty){
+            // Glass panes: render as colored background (filler items in Hypixel GUIs)
+            const paneColor = s.name ? getGlassPaneColor(s.name) : null;
+            if(paneColor){
+                div.style.background=paneColor;
+                div.style.borderColor=paneColor;
+            } else {
+            const name=s.displayName||s.name||'?';
+            const iconUrl=getItemIconUrl(s);
+            if(iconUrl){
+                const img=document.createElement('img');
+                img.className='item-icon';
+                img.src=iconUrl;
+                img.alt=stripMC(name);
+                img.loading='lazy';
+                img.onerror=function(){this.style.display='none';this.parentElement.textContent=stripMC(name).substring(0,8)};
+                div.appendChild(img);
+            }else{
+                const label=document.createElement('span');
+                label.textContent=stripMC(name).substring(0,8);
+                div.appendChild(label);
+            }
+            if(s.count>1){
+                const c=document.createElement('span');
+                c.className='count';
+                c.textContent=s.count;
+                div.appendChild(c);
+            }
+            // Tooltip
+            const tip=document.createElement('div');
+            tip.className='tooltip';
+            const tt=document.createElement('div');
+            tt.className='tip-title';
+            tt.innerHTML=mcToHtml(s.displayNameColored||name)+(s.count>1?' x'+s.count:'');
+            tip.appendChild(tt);
+            if(s.lore&&s.lore.length){
+                const loreEl=document.createElement('div');
+                loreEl.className='tip-lore';
+                loreEl.innerHTML=s.lore.map(l=>mcToHtml(l)).join('<br>');
+                tip.appendChild(loreEl);
+            }
+            div.appendChild(tip);
+            div.addEventListener('mouseenter',e=>positionTooltip(tip,e));
+            div.addEventListener('mousemove',e=>positionTooltip(tip,e));
+            div.addEventListener('mouseleave',()=>{tip.style.display='none'});
+            } // end non-glass-pane
+        }
+        grid.appendChild(div);
+    }
+}
+
+// ── Profit Charts ────────────────────────────────────────────
+let chartAH = null, chartBZ = null, chartTotal = null;
+
+function formatProfitLabel(val) {
+    if (Math.abs(val) >= 1e9) return (val/1e9).toFixed(1) + 'B';
+    if (Math.abs(val) >= 1e6) return (val/1e6).toFixed(1) + 'M';
+    if (Math.abs(val) >= 1e3) return (val/1e3).toFixed(1) + 'K';
+    return val.toString();
+}
+
+function makeChartConfig(label, color, points) {
+    const labels = points.map(p => {
+        const d = new Date(p[0] * 1000);
+        return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+    });
+    const data = points.map(p => p[1]);
+    return {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [{
+                label,
+                data,
+                borderColor: color,
+                backgroundColor: color + '33',
+                fill: true,
+                tension: 0.3,
+                pointRadius: 2,
+                pointHoverRadius: 5,
+                borderWidth: 2
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {legend:{display:false},tooltip:{callbacks:{label:ctx=>formatProfitLabel(ctx.parsed.y)+' coins'}}},
+            scales: {
+                x: {title:{display:true,text:'TIME',color:'#888'},ticks:{color:'#888',maxTicksLimit:10},grid:{color:'rgba(255,255,255,0.05)'}},
+                y: {title:{display:true,text:'PROFIT',color:'#888'},ticks:{color:'#888',callback:v=>formatProfitLabel(v)},grid:{color:'rgba(255,255,255,0.05)'}}
+            }
+        }
+    };
+}
+
+function makeTotalChartConfig(ahPoints, bzPoints) {
+    const allTimes = new Set();
+    ahPoints.forEach(p => allTimes.add(p[0]));
+    bzPoints.forEach(p => allTimes.add(p[0]));
+    const sorted = [...allTimes].sort((a,b)=>a-b);
+
+    const labels = sorted.map(t => {
+        const d = new Date(t * 1000);
+        return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+    });
+
+    function interpolate(points, times) {
+        const result = [];
+        let idx = 0;
+        for (const t of times) {
+            while (idx < points.length - 1 && points[idx+1][0] <= t) idx++;
+            result.push(idx < points.length ? points[idx][1] : 0);
+        }
+        return result;
+    }
+
+    const ahData = interpolate(ahPoints, sorted);
+    const bzData = interpolate(bzPoints, sorted);
+    const totalData = sorted.map((_, i) => ahData[i] + bzData[i]);
+
+    return {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [
+                {label:'AH Profit',data:ahData,borderColor:'#2ecc71',backgroundColor:'#2ecc7133',fill:true,tension:0.3,pointRadius:1,borderWidth:2},
+                {label:'BZ Profit',data:bzData,borderColor:'#e67e22',backgroundColor:'#e67e2233',fill:true,tension:0.3,pointRadius:1,borderWidth:2},
+                {label:'Total',data:totalData,borderColor:'#3498db',backgroundColor:'#3498db22',fill:false,tension:0.3,pointRadius:0,borderWidth:2,borderDash:[5,5]}
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {legend:{display:true,labels:{color:'#ccc'}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+': '+formatProfitLabel(ctx.parsed.y)+' coins'}}},
+            scales: {
+                x: {title:{display:true,text:'TIME',color:'#888'},ticks:{color:'#888',maxTicksLimit:10},grid:{color:'rgba(255,255,255,0.05)'}},
+                y: {title:{display:true,text:'PROFIT',color:'#888'},ticks:{color:'#888',callback:v=>formatProfitLabel(v)},grid:{color:'rgba(255,255,255,0.05)'}}
+            }
+        }
+    };
+}
+
+async function fetchProfit() {
+    try {
+        const r = await fetch('/api/profit');
+        if (r.status === 401) return;
+        const d = await r.json();
+        const upStr = formatUptime(d.uptime_seconds);
+        const hours = d.uptime_seconds / 3600;
+
+        $('ah-profit-total').textContent = formatProfitLabel(d.ah_total);
+        $('ah-uptime').textContent = upStr;
+        $('ah-per-hour').textContent = hours > 0 ? formatProfitLabel(d.ah_total / hours) : '0';
+
+        $('bz-profit-total').textContent = formatProfitLabel(d.bz_total);
+        $('bz-uptime').textContent = upStr;
+        $('bz-per-hour').textContent = hours > 0 ? formatProfitLabel(d.bz_total / hours) : '0';
+
+        const total = d.ah_total + d.bz_total;
+        $('total-profit-total').textContent = formatProfitLabel(total);
+        $('total-uptime').textContent = upStr;
+        $('total-per-hour').textContent = hours > 0 ? formatProfitLabel(total / hours) : '0';
+
+        if (chartAH) chartAH.destroy();
+        if (chartBZ) chartBZ.destroy();
+        if (chartTotal) chartTotal.destroy();
+
+        const ahCtx = $('chart-ah');
+        const bzCtx = $('chart-bz');
+        const totalCtx = $('chart-total');
+
+        if (ahCtx) chartAH = new Chart(ahCtx, makeChartConfig('AH Profit', '#2ecc71', d.ah_points));
+        if (bzCtx) chartBZ = new Chart(bzCtx, makeChartConfig('BZ Profit', '#e67e22', d.bz_points));
+        if (totalCtx) chartTotal = new Chart(totalCtx, makeTotalChartConfig(d.ah_points, d.bz_points));
+    } catch(e) { console.error('Profit fetch failed', e); }
+}
+
+setInterval(fetchProfit, 15000);
+
+// ── Config Editor ────────────────────────────────────────────
+// Config field definitions for the GUI ↔ TOML bridge
+const CONFIG_FIELDS = {
+    // strings
+    ingame_name: {type:'string', default:''},
+    websocket_url: {type:'string', default:'wss://sky.coflnet.com/modsocket'},
+    webhook_url: {type:'string', default:''},
+    bazaar_webhook_url: {type:'string', default:''},
+    discord_id: {type:'string', default:''},
+    web_gui_password: {type:'string', default:''},
+    hypixel_api_key: {type:'string', default:''},
+    proxy_address: {type:'string', default:''},
+    proxy_credentials: {type:'string', default:''},
+    // numbers
+    multi_switch_time: {type:'float', default:0.0},
+    web_gui_port: {type:'int', default:8080},
+    command_delay_ms: {type:'int', default:500},
+    bed_spam_click_delay: {type:'int', default:100},
+    bed_multiple_clicks_delay: {type:'int', default:0},
+    bed_pre_click_ms: {type:'int', default:30},
+    bazaar_order_check_interval_seconds: {type:'int', default:60},
+    bazaar_order_cancel_minutes_per_million: {type:'int', default:1},
+    bazaar_tax_rate: {type:'float', default:1.25},
+    auction_listing_delay_ms: {type:'int', default:1500},
+    auction_duration_hours: {type:'int', default:24},
+    max_items_in_inventory: {type:'int', default:12},
+    auto_cookie: {type:'int', default:0},
+    humanization_min_interval_minutes: {type:'int', default:45},
+    humanization_max_interval_minutes: {type:'int', default:120},
+    humanization_min_break_minutes: {type:'int', default:2},
+    humanization_max_break_minutes: {type:'int', default:10},
+    // booleans
+    bed_spam: {type:'bool', default:false},
+    use_cofl_chat: {type:'bool', default:true},
+    enable_console_input: {type:'bool', default:true},
+    proxy_enabled: {type:'bool', default:false},
+    share_legendary_flips: {type:'bool', default:true},
+    humanization_enabled: {type:'bool', default:false},
+};
+
+// Simple TOML parser for flat config (no nested tables except [sessions])
+function parseSimpleToml(text) {
+    const result = {};
+    for (const line of text.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('[')) continue;
+        const eqIdx = trimmed.indexOf('=');
+        if (eqIdx < 0) continue;
+        const key = trimmed.substring(0, eqIdx).trim();
+        let val = trimmed.substring(eqIdx + 1).trim();
+        // Remove inline comments
+        if (val.startsWith('"')) {
+            // String value — find closing quote
+            const endQ = val.indexOf('"', 1);
+            if (endQ >= 0) val = val.substring(0, endQ + 1);
+            result[key] = val.slice(1, -1);
+        } else if (val === 'true') {
+            result[key] = true;
+        } else if (val === 'false') {
+            result[key] = false;
+        } else {
+            // number
+            const num = parseFloat(val);
+            result[key] = isNaN(num) ? val : num;
+        }
+    }
+    return result;
+}
+
+function populateConfigGUI(parsed) {
+    for (const [key, def] of Object.entries(CONFIG_FIELDS)) {
+        const el = $('cfg-' + key);
+        if (!el) continue;
+        const val = parsed[key] !== undefined ? parsed[key] : def.default;
+        if (def.type === 'bool') {
+            el.checked = !!val;
+        } else {
+            el.value = val;
+        }
+    }
+}
+
+function buildTomlFromGUI(originalToml) {
+    // Start from the parsed values, overlay GUI changes
+    const parsed = parseSimpleToml(originalToml);
+
+    for (const [key, def] of Object.entries(CONFIG_FIELDS)) {
+        const el = $('cfg-' + key);
+        if (!el) continue;
+        if (def.type === 'bool') {
+            parsed[key] = el.checked;
+        } else if (def.type === 'int') {
+            parsed[key] = parseInt(el.value, 10) || def.default;
+        } else if (def.type === 'float') {
+            parsed[key] = parseFloat(el.value) || def.default;
+        } else {
+            parsed[key] = el.value;
+        }
+    }
+
+    function escapeTomlString(val) {
+        return '"' + (val || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+    }
+
+    function tomlLine(key, val, fieldDef) {
+        if (typeof val === 'boolean') return key + ' = ' + val;
+        if (typeof val === 'number') {
+            if (fieldDef && fieldDef.type === 'float') {
+                return key + ' = ' + (Number.isInteger(val) ? val.toFixed(1) : val);
+            }
+            return key + ' = ' + val;
+        }
+        return key + ' = ' + escapeTomlString(val);
+    }
+
+    // Rebuild TOML preserving order and known fields
+    const lines = [];
+    const written = new Set();
+    // Write known fields in order
+    for (const key of Object.keys(CONFIG_FIELDS)) {
+        const val = parsed[key];
+        written.add(key);
+        lines.push(tomlLine(key, val, CONFIG_FIELDS[key]));
+    }
+
+    // Also preserve fields that aren't in our GUI (e.g. freemoney, skip, enable_ah_flips, etc.)
+    for (const [key, val] of Object.entries(parsed)) {
+        if (written.has(key)) continue;
+        written.add(key);
+        lines.push(tomlLine(key, val, null));
+    }
+
+    return lines.join('\n') + '\n';
+}
+
+async function loadConfig() {
+    try {
+        const r = await fetch('/api/config');
+        if (r.status === 401) { showLoginOverlay(); return; }
+        if (!r.ok) { showConfigStatus('Failed to load config', true); return; }
+        const text = await r.text();
+        $('config-editor').value = text;
+        // Populate GUI fields
+        const parsed = parseSimpleToml(text);
+        populateConfigGUI(parsed);
+        hideConfigStatus();
+    } catch(e) {
+        console.error('Config load failed', e);
+        showConfigStatus('Failed to load config: ' + e.message, true);
+    }
+}
+
+async function saveConfigGUI() {
+    const originalToml = $('config-editor').value;
+    const toml = buildTomlFromGUI(originalToml);
+    if (!toml.trim()) { showConfigStatus('Config cannot be empty', true); return; }
+    // Also update the raw textarea
+    $('config-editor').value = toml;
+    try {
+        const r = await fetch('/api/config', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({config_toml: toml})
+        });
+        if (r.ok) {
+            showConfigStatus('Config saved successfully!', false);
+            fetchStatus();
+        } else {
+            const msg = await r.text();
+            showConfigStatus('Save failed: ' + msg, true);
+        }
+    } catch(e) {
+        console.error('Config save failed', e);
+        showConfigStatus('Save failed: ' + e.message, true);
+    }
+}
+
+// Keep legacy saveConfig for raw TOML editing
+async function saveConfig() {
+    const toml = $('config-editor').value;
+    if (!toml.trim()) { showConfigStatus('Config cannot be empty', true); return; }
+    try {
+        const r = await fetch('/api/config', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({config_toml: toml})
+        });
+        if (r.ok) {
+            showConfigStatus('Config saved successfully!', false);
+            fetchStatus();
+        } else {
+            const msg = await r.text();
+            showConfigStatus('Save failed: ' + msg, true);
+        }
+    } catch(e) {
+        console.error('Config save failed', e);
+        showConfigStatus('Save failed: ' + e.message, true);
+    }
+}
+
+function showConfigStatus(msg, isError) {
+    const el = $('config-status');
+    el.textContent = msg;
+    el.style.display = 'block';
+    el.style.background = isError ? 'rgba(255,95,86,.15)' : 'rgba(0,206,201,.15)';
+    el.style.color = isError ? 'var(--danger)' : 'var(--success)';
+    if (!isError) setTimeout(() => { el.style.display = 'none'; }, 4000);
+}
+
+function hideConfigStatus() {
+    $('config-status').style.display = 'none';
+}
+
+// ── Init ─────────────────────────────────────────────────────
+fetchStatus();
+fetchInventory();
+fetchAuctions();
+fetchBazaarOrders();
+connectChat();
+setInterval(fetchStatus, 3000);
+setInterval(fetchInventory, 10000);
+setInterval(fetchAuctions, 30000);
+setInterval(fetchBazaarOrders, 10000);
+</script>
+</body>
+</html>
