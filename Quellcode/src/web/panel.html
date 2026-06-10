@@ -394,6 +394,11 @@ a{color:var(--accent2);text-decoration:none}
 </div>
 
 <div class="tab-content" id="tab-bz-profit">
+    <div class="card">
+        <h2>Bazaar Item Performance</h2>
+        <div id="bazaar-performance-summary" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:14px"></div>
+        <div id="bazaar-performance-container"><p class="auction-empty">Loading...</p></div>
+    </div>
     <div class="profit-container">
         <div class="profit-chart-card">
             <canvas id="chart-bz" height="400"></canvas>
@@ -1311,7 +1316,7 @@ function switchTab(tabId) {
     if (map[tabId] !== undefined && buttons[map[tabId]]) buttons[map[tabId]].classList.add('active');
     if (tabId === 'config') loadConfig();
     if (tabId === 'game-view') startGameView(); else stopGameView();
-    if (tabId !== 'controls' && tabId !== 'config' && tabId !== 'game-view') fetchProfit();
+    if (tabId !== 'controls' && tabId !== 'config' && tabId !== 'game-view') { fetchProfit(); fetchBazaarPerformance(); }
 }
 
 // ── Game View ────────────────────────────────────────────────
@@ -1507,6 +1512,49 @@ function makeTotalChartConfig(ahPoints, bzPoints) {
     };
 }
 
+
+async function fetchBazaarPerformance() {
+    try {
+        const r = await fetch('/api/bazaar_item_performance');
+        if (r.status === 401) return;
+        const d = await r.json();
+        renderBazaarPerformance(d);
+    } catch(e) { console.error('Bazaar item performance fetch failed', e); }
+}
+
+function renderBazaarPerformance(d) {
+    const summary = $('bazaar-performance-summary');
+    const container = $('bazaar-performance-container');
+    if (!container || !summary) return;
+    const top = (d.top_profit_per_hour || []).map(i => `${i.item_name}: ${formatShortCoins(i.average_profit_per_hour)}/h`).join('<br>') || '—';
+    const bad = (d.problematic_items || []).map(i => `${i.item_name}: ${i.block_reason || i.status || 'problem'}`).join('<br>') || '—';
+    const cds = (d.cooldown_items || []).map(i => `${i.item_name}: ${i.block_reason || 'cooldown'}`).join('<br>') || '—';
+    const lots = (d.open_lot_items || []).map(i => `${i.item_name}: ${formatShortCoins(i.remaining_cost_lots_value)}`).join('<br>') || '—';
+    const neg = (d.negative_expected_profit_items || []).map(i => `${i.item_name}: ${i.blocked_negative_expected_profit_count}`).join('<br>') || '—';
+    summary.innerHTML = [
+        ['Top Profit/h', top], ['Problem Items', bad], ['Cooldowns', cds], ['Open CostLots', lots], ['Negative Blocks', neg]
+    ].map(([h,b]) => `<div class="status-item"><div class="label">${h}</div><div class="value" style="font-size:.8rem;line-height:1.35">${b}</div></div>`).join('');
+    const items = d.items || [];
+    if (!items.length) { container.innerHTML = '<p class="auction-empty">No item performance yet</p>'; return; }
+    const rows = items.map(i => `<tr>
+        <td>${i.item_name || ''}<br><span style="color:var(--text-dim);font-size:.7rem">${i.product_id || ''}</span></td>
+        <td>${formatShortCoins(i.score || 0)}</td><td>${i.status || 'ACTIVE'}</td>
+        <td>${formatShortCoins(i.total_realized_profit_known || 0)}</td><td>${formatShortCoins(i.average_profit_per_hour || 0)}</td>
+        <td>${i.successful_flips || 0}</td><td>${formatTimeDuration(i.average_buy_fill_seconds || 0)}</td><td>${formatTimeDuration(i.average_sell_fill_seconds || 0)}</td><td>${formatTimeDuration(i.average_hold_seconds || 0)}</td>
+        <td>${formatShortCoins(i.current_open_buy_capital || 0)}</td><td>${formatShortCoins(i.current_open_sell_value || 0)}</td><td>${formatShortCoins(i.remaining_cost_lots_value || 0)}</td>
+        <td>${i.reprice_count || 0}</td><td>${i.cancel_count || 0}</td><td>${i.failed_search_count || 0}</td><td>${i.cannot_afford_count || 0}</td>
+        <td>${i.block_reason || ''}${i.cooldown_until ? '<br><span style="color:var(--text-dim);font-size:.7rem">until '+new Date(i.cooldown_until*1000).toLocaleTimeString()+'</span>' : ''}</td>
+    </tr>`).join('');
+    container.innerHTML = `<div style="overflow:auto"><table class="auction-table"><thead><tr><th>Item</th><th>Score</th><th>Status</th><th>Realized Profit</th><th>Profit/h</th><th>Flips</th><th>Avg Buy Fill</th><th>Avg Sell Fill</th><th>Avg Hold</th><th>Open Buy</th><th>Open Sell</th><th>Remaining Lots</th><th>Reprices</th><th>Cancels</th><th>Failed Searches</th><th>Cannot Afford</th><th>Cooldown/Block Reason</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function formatTimeDuration(secs) {
+    if (!secs || secs <= 0) return '—';
+    if (secs < 60) return Math.round(secs) + 's';
+    if (secs < 3600) return Math.round(secs / 60) + 'm';
+    return (secs / 3600).toFixed(1) + 'h';
+}
+
 async function fetchProfit() {
     try {
         const r = await fetch('/api/profit');
@@ -1546,6 +1594,7 @@ async function fetchProfit() {
 }
 
 setInterval(fetchProfit, 15000);
+setInterval(fetchBazaarPerformance, 15000);
 
 // ── Config Editor ────────────────────────────────────────────
 // Config field definitions for the GUI ↔ TOML bridge
@@ -1601,6 +1650,10 @@ const CONFIG_FIELDS = {
     local_bazaar_max_order_value: {type:'int', default:5000000},
     local_bazaar_max_amount: {type:'int', default:71680},
     local_bazaar_price_undercut: {type:'float', default:0.1},
+    local_bazaar_min_reprice_profit_improvement: {type:'float', default:50000.0},
+    local_bazaar_min_reprice_interval_seconds: {type:'int', default:180},
+    local_bazaar_max_reprices_per_item_per_hour: {type:'int', default:4},
+    local_bazaar_reprice_cooldown_seconds: {type:'int', default:300},
     auction_listing_delay_ms: {type:'int', default:1500},
     auction_duration_hours: {type:'int', default:24},
     max_items_in_inventory: {type:'int', default:12},

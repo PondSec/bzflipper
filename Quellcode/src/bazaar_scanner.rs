@@ -170,6 +170,99 @@ pub struct LocalBazaarScanConfig {
     pub buy_sell_balance_limit: f64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ItemPerformanceInput {
+    pub successful_flips: u64,
+    pub failed_flips: u64,
+    pub average_profit_per_hour: f64,
+    pub average_buy_fill_seconds: f64,
+    pub average_sell_fill_seconds: f64,
+    pub average_hold_seconds: f64,
+    pub current_open_buy_capital: f64,
+    pub current_open_sell_value: f64,
+    pub remaining_cost_lots_value: f64,
+    pub reprice_count: u64,
+    pub cancel_count: u64,
+    pub failed_search_count: u64,
+    pub cannot_afford_count: u64,
+    pub unknown_cost_basis_count: u64,
+    pub blocked_negative_expected_profit_count: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfitHourScoreInput {
+    pub expected_net_profit: f64,
+    pub expected_roi_percent: f64,
+    pub buy_volume_hour: f64,
+    pub sell_volume_hour: f64,
+    pub volume_value_hour: f64,
+    pub top_depth_value: f64,
+    pub depth_5_value: f64,
+    pub stability_factor: f64,
+    pub competition_factor: f64,
+    pub expected_hold_minutes: f64,
+    pub performance: ItemPerformanceInput,
+}
+
+pub fn profit_hour_score(input: &ProfitHourScoreInput) -> f64 {
+    let liquidity_score = ((input.volume_value_hour / 20_000_000.0).clamp(0.15, 1.4)
+        * (input.depth_5_value / 2_000_000.0).clamp(0.15, 1.2))
+    .sqrt();
+    let fill_probability_score = (input.liquidity_score_proxy()
+        * input.stability_factor.clamp(0.15, 1.2)
+        * input.competition_factor.clamp(0.25, 1.0))
+    .clamp(0.05, 1.2);
+    let successes = input.performance.successful_flips as f64;
+    let failures = input.performance.failed_flips as f64;
+    let success_factor = ((1.0 + successes) / (1.0 + successes + failures)).clamp(0.25, 1.25);
+    let learned_profit_factor = if input.performance.average_profit_per_hour > 0.0 {
+        1.15
+    } else {
+        1.0
+    };
+    let penalty = 1.0
+        + input.performance.reprice_count as f64 * 0.08
+        + input.performance.cancel_count as f64 * 0.10
+        + input.performance.failed_search_count as f64 * 0.20
+        + input.performance.cannot_afford_count as f64 * 0.18
+        + input.performance.unknown_cost_basis_count as f64 * 0.25
+        + input.performance.blocked_negative_expected_profit_count as f64 * 0.50
+        + ((input.performance.current_open_buy_capital
+            + input.performance.current_open_sell_value
+            + input.performance.remaining_cost_lots_value)
+            / 5_000_000.0)
+            .clamp(0.0, 2.0)
+            * 0.25;
+    let sell_delay_factor = if input.performance.average_sell_fill_seconds > 0.0 {
+        (600.0 / input.performance.average_sell_fill_seconds.max(60.0)).clamp(0.25, 1.25)
+    } else {
+        1.0
+    };
+    let reliability_score =
+        (success_factor * learned_profit_factor * sell_delay_factor / penalty).clamp(0.05, 1.5);
+    input.expected_net_profit.max(0.0)
+        * fill_probability_score
+        * liquidity_score
+        * reliability_score
+        / input.expected_hold_minutes.max(1.0)
+}
+
+trait LiquidityProxy {
+    fn liquidity_score_proxy(&self) -> f64;
+}
+impl LiquidityProxy for ProfitHourScoreInput {
+    fn liquidity_score_proxy(&self) -> f64 {
+        let volume_balance = if self.buy_volume_hour.max(self.sell_volume_hour) > 0.0 {
+            self.buy_volume_hour.min(self.sell_volume_hour)
+                / self.buy_volume_hour.max(self.sell_volume_hour)
+        } else {
+            0.0
+        };
+        ((self.volume_value_hour / 20_000_000.0).clamp(0.10, 1.0) * volume_balance.clamp(0.10, 1.0))
+            .sqrt()
+    }
+}
+
 pub async fn fetch_best_flips(
     config: &LocalBazaarScanConfig,
     limit: usize,
@@ -498,7 +591,20 @@ pub async fn fetch_best_flips(
             config.target_roi_percent,
             config.preferred_volume_value_hour,
         );
-        let score = risk_adjusted_expected_profit_per_hour;
+        let expected_hold_minutes = (60.0 / estimated_cycles_per_hour.max(0.05)).max(1.0);
+        let score = profit_hour_score(&ProfitHourScoreInput {
+            expected_net_profit: total_profit,
+            expected_roi_percent: margin_percent,
+            buy_volume_hour,
+            sell_volume_hour,
+            volume_value_hour,
+            top_depth_value: top_depth_min,
+            depth_5_value: depth_5_min,
+            stability_factor,
+            competition_factor,
+            expected_hold_minutes,
+            performance: ItemPerformanceInput::default(),
+        });
 
         append_snapshot_jsonl(&MarketSnapshot {
             timestamp,
@@ -560,8 +666,8 @@ pub async fn fetch_best_flips(
     }
 
     flips.sort_by(|a, b| {
-        b.risk_adjusted_expected_profit_per_hour
-            .partial_cmp(&a.risk_adjusted_expected_profit_per_hour)
+        b.score
+            .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
                 b.volume_value_hour
@@ -908,7 +1014,7 @@ fn item_tag_to_name(tag: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::item_tag_to_name;
+    use super::{ItemPerformanceInput, ProfitHourScoreInput, item_tag_to_name, profit_hour_score};
 
     #[test]
     fn formats_item_tags() {
@@ -916,5 +1022,80 @@ mod tests {
             item_tag_to_name("ENCHANTED_COAL_BLOCK"),
             "Enchanted Coal Block"
         );
+    }
+
+    #[test]
+    fn profit_hour_scoring_prefers_faster_realized_profit() {
+        let slow = profit_hour_score(&ProfitHourScoreInput {
+            expected_net_profit: 500_000.0,
+            expected_roi_percent: 5.0,
+            buy_volume_hour: 10_000.0,
+            sell_volume_hour: 10_000.0,
+            volume_value_hour: 50_000_000.0,
+            top_depth_value: 5_000_000.0,
+            depth_5_value: 10_000_000.0,
+            stability_factor: 1.0,
+            competition_factor: 1.0,
+            expected_hold_minutes: 90.0,
+            performance: ItemPerformanceInput::default(),
+        });
+        let fast = profit_hour_score(&ProfitHourScoreInput {
+            expected_net_profit: 80_000.0,
+            expected_roi_percent: 2.0,
+            buy_volume_hour: 10_000.0,
+            sell_volume_hour: 10_000.0,
+            volume_value_hour: 50_000_000.0,
+            top_depth_value: 5_000_000.0,
+            depth_5_value: 10_000_000.0,
+            stability_factor: 1.0,
+            competition_factor: 1.0,
+            expected_hold_minutes: 5.0,
+            performance: ItemPerformanceInput::default(),
+        });
+        assert!(fast > slow, "fast={fast} slow={slow}");
+    }
+
+    #[test]
+    fn successful_items_get_higher_reliability_score() {
+        let base = ProfitHourScoreInput {
+            expected_net_profit: 100_000.0,
+            expected_roi_percent: 2.0,
+            buy_volume_hour: 10_000.0,
+            sell_volume_hour: 10_000.0,
+            volume_value_hour: 50_000_000.0,
+            top_depth_value: 5_000_000.0,
+            depth_5_value: 10_000_000.0,
+            stability_factor: 1.0,
+            competition_factor: 1.0,
+            expected_hold_minutes: 10.0,
+            performance: ItemPerformanceInput::default(),
+        };
+        let mut successful = base.clone();
+        successful.performance.successful_flips = 8;
+        successful.performance.average_profit_per_hour = 1_000_000.0;
+        let mut troubled = base;
+        troubled.performance.failed_flips = 5;
+        troubled.performance.reprice_count = 6;
+        assert!(profit_hour_score(&successful) > profit_hour_score(&troubled));
+    }
+
+    #[test]
+    fn open_lots_downprioritize_item_score() {
+        let clean = ProfitHourScoreInput {
+            expected_net_profit: 100_000.0,
+            expected_roi_percent: 2.0,
+            buy_volume_hour: 10_000.0,
+            sell_volume_hour: 10_000.0,
+            volume_value_hour: 50_000_000.0,
+            top_depth_value: 5_000_000.0,
+            depth_5_value: 10_000_000.0,
+            stability_factor: 1.0,
+            competition_factor: 1.0,
+            expected_hold_minutes: 10.0,
+            performance: ItemPerformanceInput::default(),
+        };
+        let mut stuck = clean.clone();
+        stuck.performance.remaining_cost_lots_value = 20_000_000.0;
+        assert!(profit_hour_score(&clean) > profit_hour_score(&stuck));
     }
 }
