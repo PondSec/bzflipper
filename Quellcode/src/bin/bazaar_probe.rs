@@ -1,9 +1,9 @@
-use frikadellen_baf::bazaar_scanner::{fetch_best_flips, LocalBazaarScanConfig};
+use purse_pilot::bazaar_scanner::{fetch_best_flips, LocalBazaarScanConfig};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("frikadellen_baf::bazaar_scanner=debug")
+        .with_env_filter("purse_pilot::bazaar_scanner=debug")
         .try_init();
 
     let config = LocalBazaarScanConfig {
@@ -41,6 +41,16 @@ async fn main() -> anyhow::Result<()> {
         inventory_sellable_stacks: 0,
         max_pending_buy_stacks: 6,
         buy_sell_balance_limit: 1.10,
+        total_cost_lot_value: 0.0,
+        open_buy_capital: 0.0,
+        open_sell_value: 0.0,
+        max_cost_lot_capital_ratio: 0.35,
+        max_open_buy_capital_ratio: 0.35,
+        per_item_exposure_cap: 3_000_000,
+        min_reprice_profit_improvement: 75_000.0,
+        min_reprice_interval_seconds: 240,
+        max_reprices_per_item_per_hour: 3,
+        reprice_cooldown_seconds: 360,
     };
 
     let flips = fetch_best_flips(&config, 8).await?;

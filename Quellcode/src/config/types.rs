@@ -209,6 +209,20 @@ pub struct Config {
     pub local_bazaar_max_pending_buy_stacks: u64,
     #[serde(default = "default_local_bazaar_buy_sell_balance_limit")]
     pub local_bazaar_buy_sell_balance_limit: f64,
+    #[serde(default = "default_local_bazaar_max_cost_lot_capital_ratio")]
+    pub local_bazaar_max_cost_lot_capital_ratio: f64,
+    #[serde(default = "default_local_bazaar_max_open_buy_capital_ratio")]
+    pub local_bazaar_max_open_buy_capital_ratio: f64,
+    #[serde(default = "default_local_bazaar_per_item_exposure_cap")]
+    pub local_bazaar_per_item_exposure_cap: u64,
+    #[serde(default = "default_local_bazaar_min_reprice_profit_improvement")]
+    pub local_bazaar_min_reprice_profit_improvement: f64,
+    #[serde(default = "default_local_bazaar_min_reprice_interval_seconds")]
+    pub local_bazaar_min_reprice_interval_seconds: u64,
+    #[serde(default = "default_local_bazaar_max_reprices_per_item_per_hour")]
+    pub local_bazaar_max_reprices_per_item_per_hour: u64,
+    #[serde(default = "default_local_bazaar_reprice_cooldown_seconds")]
+    pub local_bazaar_reprice_cooldown_seconds: u64,
 
     /// Prefer/allow classic high-liquidity potato book flips.
     #[serde(default = "default_true", alias = "classic_potato_book_flips")]
@@ -494,6 +508,34 @@ fn default_local_bazaar_buy_sell_balance_limit() -> f64 {
     1.10
 }
 
+fn default_local_bazaar_max_cost_lot_capital_ratio() -> f64 {
+    0.35
+}
+
+fn default_local_bazaar_max_open_buy_capital_ratio() -> f64 {
+    0.35
+}
+
+fn default_local_bazaar_per_item_exposure_cap() -> u64 {
+    3_000_000
+}
+
+fn default_local_bazaar_min_reprice_profit_improvement() -> f64 {
+    75_000.0
+}
+
+fn default_local_bazaar_min_reprice_interval_seconds() -> u64 {
+    240
+}
+
+fn default_local_bazaar_max_reprices_per_item_per_hour() -> u64 {
+    3
+}
+
+fn default_local_bazaar_reprice_cooldown_seconds() -> u64 {
+    360
+}
+
 fn default_auction_listing_delay_ms() -> u64 {
     1500
 }
@@ -576,6 +618,18 @@ impl Default for Config {
             local_bazaar_min_free_inventory_slots: default_local_bazaar_min_free_inventory_slots(),
             local_bazaar_max_pending_buy_stacks: default_local_bazaar_max_pending_buy_stacks(),
             local_bazaar_buy_sell_balance_limit: default_local_bazaar_buy_sell_balance_limit(),
+            local_bazaar_max_cost_lot_capital_ratio:
+                default_local_bazaar_max_cost_lot_capital_ratio(),
+            local_bazaar_max_open_buy_capital_ratio:
+                default_local_bazaar_max_open_buy_capital_ratio(),
+            local_bazaar_per_item_exposure_cap: default_local_bazaar_per_item_exposure_cap(),
+            local_bazaar_min_reprice_profit_improvement:
+                default_local_bazaar_min_reprice_profit_improvement(),
+            local_bazaar_min_reprice_interval_seconds:
+                default_local_bazaar_min_reprice_interval_seconds(),
+            local_bazaar_max_reprices_per_item_per_hour:
+                default_local_bazaar_max_reprices_per_item_per_hour(),
+            local_bazaar_reprice_cooldown_seconds: default_local_bazaar_reprice_cooldown_seconds(),
             enable_classic_potato_book_flips: true,
             auction_listing_delay_ms: default_auction_listing_delay_ms(),
             enable_bazaar_flips: true,
