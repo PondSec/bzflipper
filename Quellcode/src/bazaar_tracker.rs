@@ -19,8 +19,6 @@ const ORDERS_FILE: &str = "bazaar_orders.json";
 const LEGACY_BUY_COSTS_FILE: &str = "bazaar_buy_costs.json";
 /// File name for persisted FIFO buy-cost lots.
 const BUY_COST_LOTS_FILE: &str = "bazaar_buy_cost_lots.json";
-#[cfg(not(test))]
-const ITEM_PERFORMANCE_FILE: &str = "bazaar_item_performance.json";
 
 /// A single tracked bazaar order visible on the web panel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,176 +76,6 @@ pub struct SellProfitAudit {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct BazaarItemPerformance {
-    pub item_name: String,
-    pub product_id: Option<String>,
-    pub score: f64,
-    pub status: String,
-    pub successful_flips: u64,
-    pub failed_flips: u64,
-    pub total_realized_profit_known: i64,
-    pub average_profit_per_flip: f64,
-    pub average_profit_per_hour: f64,
-    pub average_buy_fill_seconds: f64,
-    pub average_sell_fill_seconds: f64,
-    pub average_hold_seconds: f64,
-    pub current_open_buy_capital: f64,
-    pub current_open_sell_value: f64,
-    pub remaining_cost_lots_value: f64,
-    pub reprice_count: u64,
-    pub cancel_count: u64,
-    pub failed_search_count: u64,
-    pub cannot_afford_count: u64,
-    pub unknown_cost_basis_count: u64,
-    pub blocked_negative_expected_profit_count: u64,
-    pub last_success_timestamp: Option<u64>,
-    pub last_failure_timestamp: Option<u64>,
-    pub cooldown_until: Option<u64>,
-    pub block_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct BazaarItemPerformanceSnapshot {
-    pub items: Vec<BazaarItemPerformance>,
-    pub top_profit_per_hour: Vec<BazaarItemPerformance>,
-    pub problematic_items: Vec<BazaarItemPerformance>,
-    pub cooldown_items: Vec<BazaarItemPerformance>,
-    pub open_lot_items: Vec<BazaarItemPerformance>,
-    pub negative_expected_profit_items: Vec<BazaarItemPerformance>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct BuySafetyDecision {
-    pub allowed: bool,
-    pub expected_profit: f64,
-    pub expected_roi_percent: f64,
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SellSafetyDecision {
-    pub allowed: bool,
-    pub expected_sell_after_tax: f64,
-    pub fifo_cost_basis_total: f64,
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RepriceDecision {
-    pub allowed: bool,
-    pub improvement: f64,
-    pub reason: Option<String>,
-}
-
-pub fn evaluate_buy_safety(
-    sell_price_per_unit: f64,
-    buy_price_per_unit: f64,
-    amount: u64,
-    bazaar_tax_rate: f64,
-    min_roi_percent: f64,
-    item_open_capital: f64,
-    max_capital_per_item: f64,
-    active_open_buy_capital: f64,
-    allowed_active_capital: f64,
-    free_purse: u64,
-    purse_reserve: u64,
-) -> BuySafetyDecision {
-    let expected_sell_after_tax =
-        sell_price_per_unit * amount as f64 * (1.0 - bazaar_tax_rate.max(0.0) / 100.0);
-    let expected_buy_total = buy_price_per_unit * amount as f64;
-    let expected_profit = expected_sell_after_tax - expected_buy_total;
-    let expected_roi_percent = if expected_buy_total > 0.0 {
-        expected_profit / expected_buy_total * 100.0
-    } else {
-        0.0
-    };
-    let reject = |reason: &str| BuySafetyDecision {
-        allowed: false,
-        expected_profit,
-        expected_roi_percent,
-        reason: Some(reason.to_string()),
-    };
-    if expected_profit <= 0.0 {
-        return reject("BLOCKED_NEGATIVE_EXPECTED_PROFIT");
-    }
-    if expected_roi_percent < min_roi_percent {
-        return reject("LOW_ROI_AFTER_TAX");
-    }
-    if max_capital_per_item > 0.0 && item_open_capital + expected_buy_total > max_capital_per_item {
-        return reject("ITEM_CAPITAL_LIMIT");
-    }
-    if active_open_buy_capital + expected_buy_total > allowed_active_capital {
-        return reject("ACTIVE_CAPITAL_LIMIT");
-    }
-    if free_purse < purse_reserve
-        || free_purse.saturating_sub(expected_buy_total.ceil() as u64) < purse_reserve
-    {
-        return reject("INSUFFICIENT_FREE_PURSE");
-    }
-    BuySafetyDecision {
-        allowed: true,
-        expected_profit,
-        expected_roi_percent,
-        reason: None,
-    }
-}
-
-pub fn evaluate_reprice(
-    old_expected_profit: f64,
-    new_expected_profit: f64,
-    order_age_seconds: u64,
-    seconds_since_last_reprice: u64,
-    reprices_this_hour: u64,
-    min_profit_improvement: f64,
-    min_interval_seconds: u64,
-    max_reprices_per_hour: u64,
-    far_from_best_price: bool,
-    fill_probability_fell: bool,
-) -> RepriceDecision {
-    let improvement = new_expected_profit - old_expected_profit;
-    if reprices_this_hour >= max_reprices_per_hour {
-        return RepriceDecision {
-            allowed: false,
-            improvement,
-            reason: Some("TOO_MANY_REPRICES".to_string()),
-        };
-    }
-    if seconds_since_last_reprice < min_interval_seconds {
-        return RepriceDecision {
-            allowed: false,
-            improvement,
-            reason: Some("REPRICE_COOLDOWN".to_string()),
-        };
-    }
-    if improvement >= min_profit_improvement {
-        return RepriceDecision {
-            allowed: true,
-            improvement,
-            reason: Some("PROFIT_IMPROVEMENT".to_string()),
-        };
-    }
-    if order_age_seconds >= min_interval_seconds && (far_from_best_price || fill_probability_fell) {
-        return RepriceDecision {
-            allowed: true,
-            improvement,
-            reason: Some(
-                if far_from_best_price {
-                    "FAR_FROM_BEST_PRICE"
-                } else {
-                    "FILL_PROBABILITY_DROPPED"
-                }
-                .to_string(),
-            ),
-        };
-    }
-    RepriceDecision {
-        allowed: false,
-        improvement,
-        reason: Some("SMALL_REPRICE_IMPROVEMENT".to_string()),
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BazaarProfitAuditSnapshot {
     pub current_fifo_realized_profit_total: i64,
     pub unknown_cost_basis_sell_total_count: u64,
@@ -280,7 +108,6 @@ pub struct BazaarOrderTracker {
     /// SELL order targets created by the local Hypixel Bazaar scanner.
     /// Maps normalized item name → (target_sell_price_per_unit, item_tag, planned_amount).
     planned_local_sells: Arc<RwLock<HashMap<String, (f64, Option<String>, Option<u64>)>>>,
-    item_performance: Arc<RwLock<HashMap<String, BazaarItemPerformance>>>,
 }
 
 impl BazaarOrderTracker {
@@ -291,7 +118,6 @@ impl BazaarOrderTracker {
             bz_list_profits: Arc::new(RwLock::new(HashMap::new())),
             profit_audit: Arc::new(RwLock::new(BazaarProfitAuditState::default())),
             planned_local_sells: Arc::new(RwLock::new(HashMap::new())),
-            item_performance: Arc::new(RwLock::new(HashMap::new())),
         };
         tracker.load_from_disk();
         tracker
@@ -307,7 +133,6 @@ impl BazaarOrderTracker {
             bz_list_profits: Arc::new(RwLock::new(HashMap::new())),
             profit_audit: Arc::new(RwLock::new(BazaarProfitAuditState::default())),
             planned_local_sells: Arc::new(RwLock::new(HashMap::new())),
-            item_performance: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -783,251 +608,6 @@ impl BazaarOrderTracker {
             .map(|(price, tag, _)| (price, tag))
     }
 
-    fn perf_key(item_name: &str, product_id: Option<&str>) -> String {
-        product_id
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_else(|| normalize_for_match(item_name))
-    }
-
-    fn update_performance<F>(&self, item_name: &str, product_id: Option<&str>, f: F)
-    where
-        F: FnOnce(&mut BazaarItemPerformance),
-    {
-        let key = Self::perf_key(item_name, product_id);
-        let mut map = self.item_performance.write();
-        let perf = map.entry(key).or_insert_with(|| BazaarItemPerformance {
-            item_name: item_name.to_string(),
-            product_id: product_id.map(str::to_string),
-            status: "ACTIVE".to_string(),
-            ..Default::default()
-        });
-        if perf.item_name.is_empty() {
-            perf.item_name = item_name.to_string();
-        }
-        if perf.product_id.is_none() {
-            perf.product_id = product_id.map(str::to_string);
-        }
-        f(perf);
-        drop(map);
-        self.save_item_performance_to_disk();
-    }
-
-    pub fn record_candidate_selected(&self, item_name: &str, product_id: Option<&str>, score: f64) {
-        self.update_performance(item_name, product_id, |p| {
-            p.score = score;
-            p.status = "SELECTED".to_string();
-        });
-    }
-
-    pub fn record_failure(
-        &self,
-        item_name: &str,
-        product_id: Option<&str>,
-        reason: &str,
-        cooldown_seconds: u64,
-    ) {
-        let now = unix_timestamp();
-        self.update_performance(item_name, product_id, |p| {
-            p.failed_flips += 1;
-            p.last_failure_timestamp = Some(now);
-            p.block_reason = Some(reason.to_string());
-            p.status = if cooldown_seconds > 0 {
-                "COOLDOWN"
-            } else {
-                "BLOCKED"
-            }
-            .to_string();
-            if cooldown_seconds > 0 {
-                p.cooldown_until = Some(now + cooldown_seconds);
-            }
-            match reason {
-                "ITEM_NOT_FOUND_IN_BAZAAR_SEARCH" => p.failed_search_count += 1,
-                "CANNOT_AFFORD" | "INSUFFICIENT_FREE_PURSE" => p.cannot_afford_count += 1,
-                "UNKNOWN_COST_BASIS" => p.unknown_cost_basis_count += 1,
-                "BLOCKED_NEGATIVE_EXPECTED_PROFIT" => p.blocked_negative_expected_profit_count += 1,
-                _ => {}
-            }
-        });
-    }
-
-    pub fn record_reprice(&self, item_name: &str, product_id: Option<&str>) {
-        self.update_performance(item_name, product_id, |p| p.reprice_count += 1);
-    }
-
-    pub fn record_cancel(&self, item_name: &str, product_id: Option<&str>) {
-        self.update_performance(item_name, product_id, |p| p.cancel_count += 1);
-    }
-
-    pub fn is_item_blocked(&self, item_name: &str, product_id: Option<&str>) -> Option<String> {
-        let now = unix_timestamp();
-        let map = self.item_performance.read();
-        let perf = map.get(&Self::perf_key(item_name, product_id))?;
-        if perf.status == "BLOCKED" {
-            return perf.block_reason.clone();
-        }
-        if perf.cooldown_until.is_some_and(|until| until > now) {
-            return perf
-                .block_reason
-                .clone()
-                .or_else(|| Some("COOLDOWN".to_string()));
-        }
-        None
-    }
-
-    pub fn record_successful_flip(
-        &self,
-        item_name: &str,
-        product_id: Option<&str>,
-        profit: i64,
-        hold_seconds: f64,
-    ) {
-        let now = unix_timestamp();
-        self.update_performance(item_name, product_id, |p| {
-            p.successful_flips += 1;
-            p.total_realized_profit_known += profit;
-            p.average_profit_per_flip =
-                p.total_realized_profit_known as f64 / p.successful_flips.max(1) as f64;
-            p.average_hold_seconds = ewma(p.average_hold_seconds, hold_seconds.max(0.0));
-            let hours = (p.average_hold_seconds / 3600.0).max(1.0 / 60.0);
-            p.average_profit_per_hour = p.average_profit_per_flip / hours;
-            p.last_success_timestamp = Some(now);
-            p.status = "ACTIVE".to_string();
-            p.block_reason = None;
-        });
-    }
-
-    pub fn fifo_cost_basis_for(&self, item_name: &str, amount: u64) -> Option<f64> {
-        let key = normalize_for_match(item_name);
-        let map = self.buy_cost_lots.read();
-        let lots = map.get(&key)?;
-        let mut remaining = amount;
-        let mut total = 0.0;
-        for lot in lots {
-            if remaining == 0 {
-                break;
-            }
-            let used = remaining.min(lot.amount);
-            total += used as f64 * lot.price_per_unit;
-            remaining -= used;
-        }
-        (remaining == 0).then_some(total)
-    }
-
-    pub fn evaluate_sell_safety(
-        &self,
-        item_name: &str,
-        amount: u64,
-        sell_price_per_unit: f64,
-        bazaar_tax_rate: f64,
-    ) -> SellSafetyDecision {
-        let expected_sell_after_tax =
-            sell_price_per_unit * amount as f64 * (1.0 - bazaar_tax_rate.max(0.0) / 100.0);
-        let Some(cost_basis) = self.fifo_cost_basis_for(item_name, amount) else {
-            return SellSafetyDecision {
-                allowed: false,
-                expected_sell_after_tax,
-                fifo_cost_basis_total: 0.0,
-                reason: Some("UNKNOWN_COST_BASIS".to_string()),
-            };
-        };
-        if expected_sell_after_tax <= cost_basis {
-            return SellSafetyDecision {
-                allowed: false,
-                expected_sell_after_tax,
-                fifo_cost_basis_total: cost_basis,
-                reason: Some("BLOCKED_NEGATIVE_EXPECTED_PROFIT".to_string()),
-            };
-        }
-        SellSafetyDecision {
-            allowed: true,
-            expected_sell_after_tax,
-            fifo_cost_basis_total: cost_basis,
-            reason: None,
-        }
-    }
-
-    pub fn item_performance_snapshot(&self) -> BazaarItemPerformanceSnapshot {
-        let now = unix_timestamp();
-        let orders = self.orders.read();
-        let lots = self.buy_cost_lots.read();
-        let mut map = self.item_performance.read().clone();
-        for order in orders.iter() {
-            let key = normalize_for_match(&order.item_name);
-            let perf = map.entry(key).or_insert_with(|| BazaarItemPerformance {
-                item_name: order.item_name.clone(),
-                status: "ACTIVE".to_string(),
-                ..Default::default()
-            });
-            let value = order.price_per_unit * order.amount as f64;
-            if order.is_buy_order {
-                perf.current_open_buy_capital += value;
-            } else {
-                perf.current_open_sell_value += value;
-            }
-        }
-        for (key, item_lots) in lots.iter() {
-            let perf = map
-                .entry(key.clone())
-                .or_insert_with(|| BazaarItemPerformance {
-                    item_name: key.clone(),
-                    status: "ACTIVE".to_string(),
-                    ..Default::default()
-                });
-            perf.remaining_cost_lots_value = item_lots
-                .iter()
-                .map(|l| l.price_per_unit * l.amount as f64)
-                .sum();
-        }
-        let mut items: Vec<_> = map.into_values().collect();
-        items.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut top = items.clone();
-        top.sort_by(|a, b| {
-            b.average_profit_per_hour
-                .partial_cmp(&a.average_profit_per_hour)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        top.truncate(5);
-        let mut problematic = items.clone();
-        problematic.sort_by_key(|p| {
-            std::cmp::Reverse(
-                p.failed_flips
-                    + p.reprice_count
-                    + p.cancel_count
-                    + p.failed_search_count
-                    + p.cannot_afford_count
-                    + p.blocked_negative_expected_profit_count,
-            )
-        });
-        problematic.truncate(5);
-        let cooldown_items = items
-            .iter()
-            .filter(|p| p.cooldown_until.is_some_and(|u| u > now) || p.status == "BLOCKED")
-            .cloned()
-            .collect();
-        let open_lot_items = items
-            .iter()
-            .filter(|p| p.remaining_cost_lots_value > 0.0)
-            .cloned()
-            .collect();
-        let negative_expected_profit_items = items
-            .iter()
-            .filter(|p| p.blocked_negative_expected_profit_count > 0)
-            .cloned()
-            .collect();
-        BazaarItemPerformanceSnapshot {
-            items,
-            top_profit_per_hour: top,
-            problematic_items: problematic,
-            cooldown_items,
-            open_lot_items,
-            negative_expected_profit_items,
-        }
-    }
-
     // ── Persistence helpers ──
 
     fn persistence_dir() -> std::path::PathBuf {
@@ -1052,31 +632,6 @@ impl BazaarOrderTracker {
                     }
                 }
                 Err(e) => warn!("[BazaarTracker] Failed to serialize orders: {}", e),
-            }
-        }
-    }
-
-    fn save_item_performance_to_disk(&self) {
-        #[cfg(test)]
-        return;
-        #[cfg(not(test))]
-        {
-            let data = self.item_performance.read().clone();
-            let path = Self::persistence_dir().join(ITEM_PERFORMANCE_FILE);
-            if let Err(e) = std::fs::create_dir_all(Self::persistence_dir()) {
-                warn!("[BazaarTracker] Failed to create persistence dir: {}", e);
-                return;
-            }
-            match serde_json::to_string(&data) {
-                Ok(json) => {
-                    if let Err(e) = std::fs::write(&path, json) {
-                        warn!("[BazaarTracker] Failed to write {}: {}", path.display(), e);
-                    }
-                }
-                Err(e) => warn!(
-                    "[BazaarTracker] Failed to serialize item performance: {}",
-                    e
-                ),
             }
         }
     }
@@ -1176,21 +731,6 @@ fn normalize_for_match(name: &str) -> String {
 }
 
 /// Public wrapper for `normalize_for_match` — used by `ManageOrders` targeted cancel.
-fn unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default()
-}
-
-fn ewma(old: f64, new: f64) -> f64 {
-    if old <= 0.0 {
-        new
-    } else {
-        old * 0.70 + new * 0.30
-    }
-}
-
 pub fn normalize_for_match_pub(name: &str) -> String {
     normalize_for_match(name)
 }
@@ -1198,96 +738,6 @@ pub fn normalize_for_match_pub(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn item_not_found_sets_cooldown_and_blocks_retry() {
-        let tracker = BazaarOrderTracker::new_in_memory();
-        tracker.record_failure(
-            "Enchantment Feast 1",
-            None,
-            "ITEM_NOT_FOUND_IN_BAZAAR_SEARCH",
-            3600,
-        );
-        assert_eq!(
-            tracker
-                .is_item_blocked("Enchantment Feast 1", None)
-                .as_deref(),
-            Some("ITEM_NOT_FOUND_IN_BAZAAR_SEARCH")
-        );
-        let snap = tracker.item_performance_snapshot();
-        let perf = snap
-            .items
-            .iter()
-            .find(|p| p.item_name == "Enchantment Feast 1")
-            .unwrap();
-        assert_eq!(perf.failed_search_count, 1);
-    }
-
-    #[test]
-    fn item_id_mismatch_blocks_item() {
-        let tracker = BazaarOrderTracker::new_in_memory();
-        tracker.record_failure(
-            "Rabbit Foot",
-            Some("ENCHANTED_RABBIT_FOOT"),
-            "ITEM_ID_MISMATCH",
-            0,
-        );
-        assert_eq!(
-            tracker
-                .is_item_blocked("Rabbit Foot", Some("ENCHANTED_RABBIT_FOOT"))
-                .as_deref(),
-            Some("ITEM_ID_MISMATCH")
-        );
-    }
-
-    #[test]
-    fn negative_sell_is_blocked_without_consuming_fifo_lots() {
-        let tracker = BazaarOrderTracker::new_in_memory();
-        tracker.record_buy_cost("Enchanted Rabbit Foot", 1497.0, 1489);
-        let decision = tracker.evaluate_sell_safety("Enchanted Rabbit Foot", 1489, 795.1, 1.25);
-        assert!(!decision.allowed);
-        assert_eq!(
-            decision.reason.as_deref(),
-            Some("BLOCKED_NEGATIVE_EXPECTED_PROFIT")
-        );
-        let snapshot = tracker.profit_audit_snapshot();
-        assert_eq!(
-            snapshot.remaining_cost_lots["enchanted rabbit foot"][0].amount,
-            1489
-        );
-    }
-
-    #[test]
-    fn reprice_protection_requires_meaningful_improvement() {
-        let small = evaluate_reprice(
-            100_000.0, 105_000.0, 300, 300, 0, 50_000.0, 180, 4, false, false,
-        );
-        assert!(!small.allowed);
-        assert_eq!(small.reason.as_deref(), Some("SMALL_REPRICE_IMPROVEMENT"));
-        let large = evaluate_reprice(
-            100_000.0, 200_000.0, 300, 300, 0, 50_000.0, 180, 4, false, false,
-        );
-        assert!(large.allowed);
-    }
-
-    #[test]
-    fn cannot_afford_buy_is_blocked_before_order_attempt() {
-        let decision = evaluate_buy_safety(
-            1100.0,
-            1000.0,
-            100,
-            1.25,
-            1.0,
-            0.0,
-            1_000_000.0,
-            0.0,
-            1_000_000.0,
-            50_000,
-            10_000,
-        );
-        assert!(!decision.allowed);
-        assert_eq!(decision.reason.as_deref(), Some("INSUFFICIENT_FREE_PURSE"));
-    }
 
     #[test]
     fn crystalized_moonlight_fifo_profit_is_positive() {
@@ -1594,16 +1044,12 @@ mod tests {
         assert_eq!(removed, 1);
         let remaining = tracker.get_orders();
         assert_eq!(remaining.len(), 2);
-        assert!(
-            remaining
-                .iter()
-                .any(|o| o.item_name == "Coal" && o.is_buy_order)
-        );
-        assert!(
-            remaining
-                .iter()
-                .any(|o| o.item_name == "Diamond" && !o.is_buy_order)
-        );
+        assert!(remaining
+            .iter()
+            .any(|o| o.item_name == "Coal" && o.is_buy_order));
+        assert!(remaining
+            .iter()
+            .any(|o| o.item_name == "Diamond" && !o.is_buy_order));
     }
 
     #[test]
