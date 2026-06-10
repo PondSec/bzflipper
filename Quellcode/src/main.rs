@@ -898,9 +898,8 @@ async fn main() -> Result<()> {
                 );
             }
             if entry.bz_total != 0 {
-                tracker.set_bz_total(entry.bz_total);
                 info!(
-                    "[Profit] Restored BZ profit from disk: {} coins",
+                    "[Profit] Ignoring persisted BZ profit on startup so the graph starts from local FIFO-only accounting: {} coins",
                     entry.bz_total
                 );
             }
@@ -1089,12 +1088,12 @@ async fn main() -> Result<()> {
                         );
                     }
 
-                    // Parse `/cofl bz h` response for authoritative BZ session profit.
-                    // "Total Profit: -234M" (inside "Bazaar Profit History for <ign> ...")
+                    // Parse `/cofl bz h` only for diagnostics. External/Coflnet history is legacy
+                    // for the web graph and must not overwrite local FIFO realized profit.
                     if let Some(bz_profit) = parse_cofl_bz_h_total_profit(&clean) {
-                        profit_tracker_events.set_bz_total(bz_profit);
+                        bazaar_tracker_events.record_ignored_legacy_profit(bz_profit, "/cofl bz h");
                         tracing::info!(
-                            "[CoflBzH] Updated BZ total from /cofl bz h: {} coins",
+                            "[CoflBzH] Ignored external BZ total for graph (FIFO-only): {} coins",
                             bz_profit
                         );
                     }
@@ -1864,50 +1863,57 @@ async fn main() -> Result<()> {
                         debug!("[BazaarProfit] No tracked order for collected {} {} (may be from a previous session)",
                             if is_buy_order { "BUY" } else { "SELL" }, item_name);
                     }
-                    // Compute profit/loss for sell offers: sell_total - buy_total - tax.
-                    // This is used for the immediate chat display; the session profit
-                    // total is driven by `/cofl bz l` via set_bz_total().
-                    // Bazaar tax is applied to sell proceeds (default 1.25%).
-                    //
-                    // When a sell is partially filled, only use the actual sold quantity
-                    // for both sell revenue AND buy cost comparison.  Using per-unit buy
-                    // cost × actual_sold prevents the false loss that occurred when comparing
-                    // partial sell revenue against the TOTAL buy cost for all purchased units.
+                    // Compute realized Bazaar profit strictly from local FIFO lots.
+                    // UNKNOWN_COST_BASIS sells are audited but never counted in the graph.
                     let bazaar_tax_rate = config_for_events.bazaar_tax_rate;
                     let opt_profit: Option<i64> = if !is_buy_order {
                         if let Some(ref sell_order) = order_data {
-                            let sell_total = sell_order.price_per_unit * actual_amount as f64;
-                            let tax = sell_total * (bazaar_tax_rate / 100.0);
-                            let sell_after_tax = sell_total - tax;
-                            if let Some((buy_ppu, _buy_amt)) =
-                                bazaar_tracker_events.take_buy_cost(&item_name)
-                            {
-                                // Use per-unit buy cost × actual sold quantity, NOT
-                                // buy_ppu × total_buy_amount.  This correctly handles
-                                // partial sells (e.g. sold 21 of 64 bought).
-                                let buy_total = buy_ppu * actual_amount as f64;
-                                let profit = (sell_after_tax - buy_total).round() as i64;
-                                // Session BZ profit is tracked via /cofl bz l (set_bz_total),
-                                // so we don't call record_bz_profit here.
-                                info!("[BazaarProfit] SELL {} — {} units, sell: {:.0}, tax: {:.0} ({:.2}%), buy: {:.0} ({:.0}/ea), profit: {}",
-                                    item_name, actual_amount, sell_total, tax, bazaar_tax_rate, buy_total, buy_ppu, profit);
-                                Some(profit)
-                            } else if let Some(bz_list_profit) =
-                                bazaar_tracker_events.get_bz_list_profit(&item_name)
-                            {
-                                // Fallback: use profit from /cofl bz l for this item
-                                info!("[BazaarProfit] SELL {} — sell: {:.0}, tax: {:.0}, no local buy cost, using /cofl bz l profit: {}",
-                                    item_name, sell_total, tax, bz_list_profit);
-                                Some(bz_list_profit)
+                            let gross_list_value = sell_order.price_per_unit * actual_amount as f64;
+                            let tax = gross_list_value * (bazaar_tax_rate / 100.0);
+                            let claimed_after_tax = gross_list_value - tax;
+                            let audit = bazaar_tracker_events.account_sell_collect(
+                                &item_name,
+                                actual_amount,
+                                claimed_after_tax,
+                                Some(gross_list_value),
+                            );
+                            info!(
+                                "[BazaarProfitAudit] SELL {} — sold_amount={}, claimed_coins_after_tax={:.0}, gross_list_value={:.0}, lots_used={:?}, cost_basis_total={:.0}, cost_basis_status={}, realized_profit={}, reason={}",
+                                audit.item_name,
+                                audit.sold_amount,
+                                audit.claimed_coins_after_tax,
+                                audit.gross_list_value.unwrap_or(0.0),
+                                audit.lots_used,
+                                audit.cost_basis_total,
+                                audit.cost_basis_status.as_str(),
+                                audit.realized_profit,
+                                audit.reason.as_deref().unwrap_or("none")
+                            );
+                            if matches!(
+                                audit.cost_basis_status,
+                                frikadellen_baf::bazaar_tracker::CostBasisStatus::Known
+                            ) {
+                                profit_tracker_events.record_bz_profit(audit.realized_profit);
+                                Some(audit.realized_profit)
                             } else {
-                                // No buy cost recorded and no /cofl bz l data —
-                                // do NOT report sell proceeds as profit (the item
-                                // was not free).
-                                info!("[BazaarProfit] SELL {} — sell: {:.0}, tax: {:.0}, no buy cost or /cofl bz l data, skipping profit",
-                                    item_name, sell_total, tax);
                                 None
                             }
                         } else {
+                            let audit = bazaar_tracker_events.account_sell_collect(
+                                &item_name,
+                                actual_amount,
+                                0.0,
+                                None,
+                            );
+                            info!(
+                                "[BazaarProfitAudit] SELL {} — sold_amount={}, claimed_coins_after_tax=unknown, gross_list_value=unknown, lots_used={:?}, cost_basis_total={:.0}, cost_basis_status={}, realized_profit=0, reason={}",
+                                audit.item_name,
+                                audit.sold_amount,
+                                audit.lots_used,
+                                audit.cost_basis_total,
+                                audit.cost_basis_status.as_str(),
+                                audit.reason.as_deref().unwrap_or("missing_tracked_sell_order")
+                            );
                             None
                         }
                     } else {
@@ -2108,7 +2114,7 @@ async fn main() -> Result<()> {
                     // When a SELL order is filled the flip is complete in Coflnet's
                     // view.  Request `/cofl bz l` (with a short delay so Coflnet
                     // finishes recording the flip) — the response handler will parse
-                    // profits and update the session BZ total via set_bz_total().
+                    // profits for diagnostics without changing the FIFO-only graph.
                     if !is_buy_order {
                         let ws = ws_client_for_events.clone();
                         let ws2 = ws_client_for_events.clone();
@@ -2218,7 +2224,6 @@ async fn main() -> Result<()> {
     let license_default_sent_ws = license_default_sent.clone();
     let ingame_name_ws = ingame_name.clone();
     let bazaar_tracker_ws = bazaar_tracker.clone();
-    let profit_tracker_ws = profit_tracker.clone();
     // Accumulator for `/cofl bz l` output: (total_profit, flip_count, last_update).
     // Reset when "Last Completed Bazaar Flips" header is seen; each parsed flip
     // line adds to the total.  A debounce task displays the summary after 2s idle.
@@ -2635,7 +2640,6 @@ async fn main() -> Result<()> {
                                 let items_clone = bz_list_items.clone();
                                 let tracker = bazaar_tracker_ws.clone();
                                 let tx = chat_tx_ws.clone();
-                                let pt = profit_tracker_ws.clone();
                                 tokio::spawn(async move {
                                     // Wait for the full list to arrive.
                                     tokio::time::sleep(tokio::time::Duration::from_secs(
@@ -2645,10 +2649,11 @@ async fn main() -> Result<()> {
                                     if let Ok(acc) = accum.lock() {
                                         let (total, count, _) = *acc;
                                         if count > 0 {
-                                            // Use the `/cofl bz l` total as the authoritative
-                                            // BZ session profit (replaces local calculation).
-                                            pt.set_bz_total(total);
-                                            tracing::info!("[BZList] Updated BZ profit from /cofl bz l: {} coins ({} flips)", total, count);
+                                            // `/cofl bz l` is external/legacy history. Keep it visible in chat,
+                                            // but never overwrite the FIFO-only web graph.
+                                            tracker
+                                                .record_ignored_legacy_profit(total, "/cofl bz l");
+                                            tracing::info!("[BZList] Ignored /cofl bz l total for graph (FIFO-only): {} coins ({} flips)", total, count);
                                             let (color, sign) = if total >= 0 {
                                                 ("§a", "+")
                                             } else {

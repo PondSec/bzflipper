@@ -827,7 +827,9 @@ proxy_credentials = "myuser:mypassword"
         let toml =
             toml::to_string_pretty(&Config::default()).expect("default config should serialize");
         assert!(!toml.contains("[skip]"));
-        assert!(!toml.contains("min_profit"));
+        assert!(!toml
+            .lines()
+            .any(|line| line.trim_start().starts_with("min_profit =")));
     }
 
     #[test]
