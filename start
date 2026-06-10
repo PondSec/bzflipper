@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "$(dirname "$0")/Quellcode-aktuell"
+cd "$(dirname "$0")/Quellcode"
 exec cargo run --bin frikadellen_baf

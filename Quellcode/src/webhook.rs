@@ -22,7 +22,11 @@ fn notify_relay_url() -> Option<String> {
     COMPILE_TIME
         .filter(|s| !s.is_empty())
         .map(|s| s.to_owned())
-        .or_else(|| std::env::var("BAF_NOTIFY_RELAY_URL").ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            std::env::var("BAF_NOTIFY_RELAY_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
 }
 
 /// Return the HMAC-SHA256 signing secret.
@@ -36,15 +40,18 @@ fn notify_relay_secret() -> Option<String> {
     COMPILE_TIME
         .filter(|s| !s.is_empty())
         .map(|s| s.to_owned())
-        .or_else(|| std::env::var("BAF_NOTIFY_SECRET").ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            std::env::var("BAF_NOTIFY_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
 }
 
 /// Compute an HMAC-SHA256 hex digest over `message` using `key`.
 fn hmac_sha256_hex(key: &str, message: &str) -> String {
     use hmac::{Hmac, Mac};
     type HmacSha256 = Hmac<sha2::Sha256>;
-    let mut mac = HmacSha256::new_from_slice(key.as_bytes())
-        .expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
     mac.update(message.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
@@ -98,11 +105,18 @@ async fn post_embed(webhook_url: &str, payload: serde_json::Value) {
 }
 
 /// Post an embed with optional text content (used for Discord pings).
-async fn post_embed_with_content(webhook_url: &str, content: Option<&str>, payload: serde_json::Value) {
+async fn post_embed_with_content(
+    webhook_url: &str,
+    content: Option<&str>,
+    payload: serde_json::Value,
+) {
     let mut body = payload;
     if let Some(text) = content {
         if let Some(obj) = body.as_object_mut() {
-            obj.insert("content".to_string(), serde_json::Value::String(text.to_string()));
+            obj.insert(
+                "content".to_string(),
+                serde_json::Value::String(text.to_string()),
+            );
         }
     }
     if let Err(e) = HTTP_CLIENT.post(webhook_url).json(&body).send().await {
@@ -125,7 +139,13 @@ fn format_number(n: f64) -> String {
 /// Converts "Meteor Magma Lord Helmet Skin" → "METEOR_MAGMA_LORD_HELMET_SKIN".
 fn sanitize_item_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
         .collect::<String>()
         .trim_matches('_')
         .to_string()
@@ -203,7 +223,6 @@ pub async fn send_webhook_auth_failed(
     post_embed_with_content(webhook_url, ping.as_deref(), payload).await;
 }
 
-
 pub async fn send_webhook_initialized(
     ingame_name: &str,
     ah_enabled: bool,
@@ -268,8 +287,16 @@ pub async fn send_webhook_startup_complete(
 ) {
     let mut description = format!(
         "Ready to accept flips!\n\nAH Flips: {}\nBazaar Flips: {}",
-        if ah_enabled { "✅ Enabled" } else { "❌ Disabled" },
-        if bazaar_enabled { "✅ Enabled" } else { "❌ Disabled" }
+        if ah_enabled {
+            "✅ Enabled"
+        } else {
+            "❌ Disabled"
+        },
+        if bazaar_enabled {
+            "✅ Enabled"
+        } else {
+            "❌ Disabled"
+        }
     );
     if let Some((tier, expires)) = premium {
         description.push_str(&format!("\n\n**Coflnet {}** expires {}", tier, expires));
@@ -441,7 +468,11 @@ pub async fn send_webhook_bazaar_order_placed(
     purse: Option<u64>,
     webhook_url: &str,
 ) {
-    let order_type = if is_buy_order { "Buy Order" } else { "Sell Offer" };
+    let order_type = if is_buy_order {
+        "Buy Order"
+    } else {
+        "Sell Offer"
+    };
     let order_emoji = if is_buy_order { "🛒" } else { "🏷️" };
     let color: u32 = if is_buy_order { 0x00cccc } else { 0xff9900 };
     let safe_item = sanitize_item_name(item_name);
@@ -477,7 +508,11 @@ pub async fn send_webhook_bazaar_order_collected(
     purse: Option<u64>,
     webhook_url: &str,
 ) {
-    let order_type = if is_buy_order { "Buy Order" } else { "Sell Offer" };
+    let order_type = if is_buy_order {
+        "Buy Order"
+    } else {
+        "Sell Offer"
+    };
     let color: u32 = if is_buy_order {
         0x66FF66
     } else {
@@ -550,7 +585,11 @@ pub async fn send_webhook_bazaar_order_cancelled(
     purse: Option<u64>,
     webhook_url: &str,
 ) {
-    let order_type = if is_buy_order { "Buy Order" } else { "Sell Offer" };
+    let order_type = if is_buy_order {
+        "Buy Order"
+    } else {
+        "Sell Offer"
+    };
     let order_emoji = "🚫";
     let color: u32 = 0x808080; // Gray for cancellation
     let safe_item = sanitize_item_name(item_name);
@@ -587,10 +626,7 @@ pub async fn send_webhook_bazaar_order_cancelled(
 }
 
 /// Webhook sent when the bazaar daily sell value limit is reached.
-pub async fn send_webhook_bazaar_daily_limit(
-    ingame_name: &str,
-    webhook_url: &str,
-) {
+pub async fn send_webhook_bazaar_daily_limit(ingame_name: &str, webhook_url: &str) {
     let payload = serde_json::json!({
         "embeds": [{
             "title": "⚠️ Bazaar Daily Limit Reached",
@@ -670,7 +706,11 @@ pub async fn send_webhook_banned(
         }));
     }
     if let Some(ban_id) = &parsed.ban_id {
-        let id_label = if parsed.is_security_ban { "🔖 Block ID" } else { "🔖 Ban ID" };
+        let id_label = if parsed.is_security_ban {
+            "🔖 Block ID"
+        } else {
+            "🔖 Ban ID"
+        };
         fields.push(serde_json::json!({
             "name": id_label,
             "value": format!("`{}`", ban_id),
@@ -699,12 +739,18 @@ pub async fn send_webhook_banned(
         if parsed.clean_text.is_empty() {
             format!("**{}** has been security blocked.\nCheck <https://www.hypixel.net/security-block> for details.", ingame_name)
         } else {
-            format!("**{}** has been security blocked.\n\n{}", ingame_name, parsed.clean_text)
+            format!(
+                "**{}** has been security blocked.\n\n{}",
+                ingame_name, parsed.clean_text
+            )
         }
     } else if parsed.clean_text.is_empty() {
         format!("**{}** has been banned.", ingame_name)
     } else {
-        format!("**{}** has been banned.\n\n{}", ingame_name, parsed.clean_text)
+        format!(
+            "**{}** has been banned.\n\n{}",
+            ingame_name, parsed.clean_text
+        )
     };
 
     let mut embed = serde_json::json!({
@@ -718,7 +764,10 @@ pub async fn send_webhook_banned(
         "timestamp": chrono::Utc::now().to_rfc3339()
     });
     if !fields.is_empty() {
-        embed.as_object_mut().expect("embed is a JSON object").insert("fields".to_string(), serde_json::json!(fields));
+        embed
+            .as_object_mut()
+            .expect("embed is a JSON object")
+            .insert("fields".to_string(), serde_json::json!(fields));
     }
 
     let payload = serde_json::json!({ "embeds": [embed] });
@@ -816,7 +865,14 @@ pub async fn send_webhook_legendary_flip(
     discord_id: Option<&str>,
     webhook_url: &str,
 ) {
-    let fields = build_purchase_fields(price, target, Some(profit), buy_speed_ms, finder, auction_uuid);
+    let fields = build_purchase_fields(
+        price,
+        target,
+        Some(profit),
+        buy_speed_ms,
+        finder,
+        auction_uuid,
+    );
     let safe_item = sanitize_item_name(item_name);
     let payload = serde_json::json!({
         "embeds": [{
@@ -853,7 +909,14 @@ pub async fn send_webhook_divine_flip(
     discord_id: Option<&str>,
     webhook_url: &str,
 ) {
-    let fields = build_purchase_fields(price, target, Some(profit), buy_speed_ms, finder, auction_uuid);
+    let fields = build_purchase_fields(
+        price,
+        target,
+        Some(profit),
+        buy_speed_ms,
+        finder,
+        auction_uuid,
+    );
     let safe_item = sanitize_item_name(item_name);
     let payload = serde_json::json!({
         "embeds": [{
@@ -938,13 +1001,11 @@ fn build_purchase_fields(
     finder: Option<&str>,
     auction_uuid: Option<&str>,
 ) -> Vec<serde_json::Value> {
-    let mut fields = vec![
-        serde_json::json!({
-            "name": "💰 Purchase Price",
-            "value": format!("```fix\n{} coins\n```", format_number(price as f64)),
-            "inline": true
-        }),
-    ];
+    let mut fields = vec![serde_json::json!({
+        "name": "💰 Purchase Price",
+        "value": format!("```fix\n{} coins\n```", format_number(price as f64)),
+        "inline": true
+    })];
     if let Some(t) = target {
         fields.push(serde_json::json!({
             "name": "🎯 Target Price",
@@ -986,7 +1047,9 @@ fn build_purchase_fields(
                     let mut c = w.chars();
                     match c.next() {
                         None => String::new(),
-                        Some(first) => first.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
+                        Some(first) => {
+                            first.to_uppercase().collect::<String>() + &c.as_str().to_lowercase()
+                        }
                     }
                 })
                 .collect::<Vec<_>>()
@@ -1039,9 +1102,21 @@ pub fn parse_ban_reason(reason: &str) -> ParsedBan {
         while i < bytes.len() && bytes[i] != b'"' {
             if bytes[i] == b'\\' && i + 1 < bytes.len() {
                 match bytes[i + 1] {
-                    b'n' => { s.push('\n'); i += 2; continue; }
-                    b'"' => { s.push('"'); i += 2; continue; }
-                    b'\\' => { s.push('\\'); i += 2; continue; }
+                    b'n' => {
+                        s.push('\n');
+                        i += 2;
+                        continue;
+                    }
+                    b'"' => {
+                        s.push('"');
+                        i += 2;
+                        continue;
+                    }
+                    b'\\' => {
+                        s.push('\\');
+                        i += 2;
+                        continue;
+                    }
                     _ => {}
                 }
             }
@@ -1064,11 +1139,18 @@ pub fn parse_ban_reason(reason: &str) -> ParsedBan {
         || lower.contains("block id:");
 
     // Extract duration (e.g. "29d 23h 59m 58s")
-    let duration = texts.iter().find(|t| {
-        let t = t.trim();
-        !t.is_empty() && t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
-            && (t.contains('d') || t.contains('h') || t.contains('m') || t.contains('s'))
-    }).map(|s| s.trim().to_string());
+    let duration = texts
+        .iter()
+        .find(|t| {
+            let t = t.trim();
+            !t.is_empty()
+                && t.chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+                && (t.contains('d') || t.contains('h') || t.contains('m') || t.contains('s'))
+        })
+        .map(|s| s.trim().to_string());
 
     // Extract ban reason
     let reason_text = {
@@ -1077,7 +1159,10 @@ pub fn parse_ban_reason(reason: &str) -> ParsedBan {
         for t in &texts {
             if found {
                 let trimmed = t.trim().trim_end_matches('\n');
-                if !trimmed.is_empty() && !trimmed.starts_with("Find out more") && !trimmed.starts_with("Ban ID") {
+                if !trimmed.is_empty()
+                    && !trimmed.starts_with("Find out more")
+                    && !trimmed.starts_with("Ban ID")
+                {
                     result = Some(trimmed.to_string());
                 }
                 break;
@@ -1102,8 +1187,10 @@ pub fn parse_ban_reason(reason: &str) -> ParsedBan {
                 break;
             }
             let tt = t.trim();
-            if tt.starts_with("Ban ID:") || tt == "Ban ID: "
-                || tt.starts_with("Block ID:") || tt == "Block ID: "
+            if tt.starts_with("Ban ID:")
+                || tt == "Ban ID: "
+                || tt.starts_with("Block ID:")
+                || tt == "Block ID: "
             {
                 found = true;
             }
@@ -1112,7 +1199,9 @@ pub fn parse_ban_reason(reason: &str) -> ParsedBan {
     };
 
     // Extract appeal URL (regular bans use /appeal, security bans use /security-block)
-    let appeal_url = texts.iter().find(|t| t.contains("hypixel.net/appeal") || t.contains("hypixel.net/security-block"))
+    let appeal_url = texts
+        .iter()
+        .find(|t| t.contains("hypixel.net/appeal") || t.contains("hypixel.net/security-block"))
         .map(|s| s.trim().trim_end_matches('\n').to_string());
 
     // Build clean text summary (no raw debug output)
@@ -1194,10 +1283,7 @@ pub async fn send_webhook_rest_break_start(
 }
 
 /// Send a webhook when the bot reconnects after a rest break.
-pub async fn send_webhook_rest_break_end(
-    ingame_name: &str,
-    webhook_url: &str,
-) {
+pub async fn send_webhook_rest_break_end(ingame_name: &str, webhook_url: &str) {
     let payload = serde_json::json!({
         "embeds": [{
             "title": "☀️ Break Over",
@@ -1222,9 +1308,15 @@ mod tests {
         let parsed = parse_ban_reason(reason);
         assert!(!parsed.is_permanent);
         assert_eq!(parsed.duration.as_deref(), Some("29d 23h 59m 58s"));
-        assert_eq!(parsed.reason.as_deref(), Some("Cheating through the use of unfair game advantages."));
+        assert_eq!(
+            parsed.reason.as_deref(),
+            Some("Cheating through the use of unfair game advantages.")
+        );
         assert_eq!(parsed.ban_id.as_deref(), Some("#AF4CD6A8"));
-        assert_eq!(parsed.appeal_url.as_deref(), Some("https://www.hypixel.net/appeal"));
+        assert_eq!(
+            parsed.appeal_url.as_deref(),
+            Some("https://www.hypixel.net/appeal")
+        );
     }
 
     #[test]
@@ -1251,9 +1343,15 @@ mod tests {
         let parsed = parse_ban_reason(reason);
         assert!(parsed.is_security_ban);
         assert!(!parsed.is_permanent);
-        assert_eq!(parsed.reason.as_deref(), Some("Suspicious activity has been detected on your account."));
+        assert_eq!(
+            parsed.reason.as_deref(),
+            Some("Suspicious activity has been detected on your account.")
+        );
         assert_eq!(parsed.ban_id.as_deref(), Some("#ABC12345"));
-        assert_eq!(parsed.appeal_url.as_deref(), Some("https://www.hypixel.net/security-block"));
+        assert_eq!(
+            parsed.appeal_url.as_deref(),
+            Some("https://www.hypixel.net/security-block")
+        );
     }
 
     #[test]

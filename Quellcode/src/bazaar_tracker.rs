@@ -8,21 +8,15 @@
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
 /// File name for persisted orders (stored next to the executable / in the logs dir).
 const ORDERS_FILE: &str = "bazaar_orders.json";
-/// File name for persisted FIFO buy-cost lots.
-const BUY_COSTS_FILE: &str = "bazaar_buy_cost_lots.json";
-/// Legacy pre-lot buy-cost file. Never migrated automatically because it can
-/// contain stale weighted-average costs from older sessions.
-const LEGACY_BUY_COSTS_FILE: &str = "bazaar_buy_costs.json";
+/// File name for persisted buy costs.
+const BUY_COSTS_FILE: &str = "bazaar_buy_costs.json";
 
 /// A single tracked bazaar order visible on the web panel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,64 +31,31 @@ pub struct TrackedBazaarOrder {
     pub placed_at: u64,
 }
 
-/// One realized BUY fill used as cost basis for a future SELL collection.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BuyCostLot {
-    /// Display item name as seen when the BUY order was collected.
-    pub item: String,
-    /// Remaining units in this lot.
-    pub amount: u64,
-    /// BUY price per unit in coins.
-    pub unit_cost: f64,
-    /// Remaining total cost (`amount * unit_cost`) in coins.
-    pub total_cost: f64,
-    /// Unix timestamp (seconds) when the BUY collection was recorded.
-    pub timestamp: u64,
-    /// Optional order id for future integrations. Current in-game events do not expose one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub order_id: Option<String>,
-}
-
-/// Cost basis consumed for one SELL collection.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ConsumedLotCosts {
-    pub amount: u64,
-    pub total_cost: f64,
-    pub weighted_unit_cost: f64,
-    pub lots_consumed: usize,
-}
-
-/// Reason why a SELL collection could not be matched to known FIFO BUY lots.
-#[derive(Debug, Clone, PartialEq)]
-pub enum UnknownCostBasis {
-    NoLots,
-    InsufficientLots { requested: u64, available: u64 },
-    ZeroAmount,
-}
-
 /// Thread-safe tracker for active bazaar orders.
 #[derive(Clone)]
 pub struct BazaarOrderTracker {
     orders: Arc<RwLock<Vec<TrackedBazaarOrder>>>,
-    /// FIFO buy-cost lots keyed by normalized item name. Each collected BUY
-    /// creates one lot; each collected SELL consumes lots from the front.
-    buy_cost_lots: Arc<RwLock<HashMap<String, VecDeque<BuyCostLot>>>>,
+    /// Stores (price_per_unit, amount) for all collected buy orders per item,
+    /// so that profit can be computed when the corresponding sell offer is
+    /// collected.  Multiple buy orders for the same item are accumulated
+    /// (weighted-average PPU) instead of overwriting.
+    last_buy_costs: Arc<RwLock<HashMap<String, (f64, u64)>>>,
     /// Per-item profit data from `/cofl bz l` output.
     /// Maps normalized item name → (total_profit, flip_count).
     /// Used as a fallback when local buy-cost tracking has no data for a sell.
     bz_list_profits: Arc<RwLock<HashMap<String, (i64, u32)>>>,
-    /// Count of SELL collections that were intentionally not booked because
-    /// matching FIFO BUY lots were missing/insufficient.
-    unknown_cost_basis_sells: Arc<AtomicU64>,
+    /// SELL order targets created by the local Hypixel Bazaar scanner.
+    /// Maps normalized item name → (target_sell_price_per_unit, item_tag, planned_amount).
+    planned_local_sells: Arc<RwLock<HashMap<String, (f64, Option<String>, Option<u64>)>>>,
 }
 
 impl BazaarOrderTracker {
     pub fn new() -> Self {
         let tracker = Self {
             orders: Arc::new(RwLock::new(Vec::new())),
-            buy_cost_lots: Arc::new(RwLock::new(HashMap::new())),
+            last_buy_costs: Arc::new(RwLock::new(HashMap::new())),
             bz_list_profits: Arc::new(RwLock::new(HashMap::new())),
-            unknown_cost_basis_sells: Arc::new(AtomicU64::new(0)),
+            planned_local_sells: Arc::new(RwLock::new(HashMap::new())),
         };
         tracker.load_from_disk();
         tracker
@@ -106,9 +67,9 @@ impl BazaarOrderTracker {
     pub fn new_in_memory() -> Self {
         Self {
             orders: Arc::new(RwLock::new(Vec::new())),
-            buy_cost_lots: Arc::new(RwLock::new(HashMap::new())),
+            last_buy_costs: Arc::new(RwLock::new(HashMap::new())),
             bz_list_profits: Arc::new(RwLock::new(HashMap::new())),
-            unknown_cost_basis_sells: Arc::new(AtomicU64::new(0)),
+            planned_local_sells: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -228,10 +189,32 @@ impl BazaarOrderTracker {
         // Build a count map: (normalized_name, is_buy) → how many in-game.
         let mut ingame_counts: std::collections::HashMap<(String, bool), usize> =
             std::collections::HashMap::new();
-        for (name, is_buy, _, _) in ingame_orders {
+        let mut ingame_details: std::collections::HashMap<(String, bool), Vec<(u64, f64)>> =
+            std::collections::HashMap::new();
+        for (name, is_buy, amount, _) in ingame_orders {
+            if !*is_buy && *amount == 0 {
+                debug!(
+                    "[BazaarTracker] Ignoring zero-amount in-game SELL order for {} during reconcile",
+                    name
+                );
+                continue;
+            }
             *ingame_counts
                 .entry((normalize_for_match(name), *is_buy))
                 .or_insert(0) += 1;
+        }
+        for (name, is_buy, amount, price_per_unit) in ingame_orders {
+            if !*is_buy && *amount == 0 {
+                debug!(
+                    "[BazaarTracker] Ignoring zero-amount in-game SELL order for {} during reconcile",
+                    name
+                );
+                continue;
+            }
+            ingame_details
+                .entry((normalize_for_match(name), *is_buy))
+                .or_default()
+                .push((*amount, *price_per_unit));
         }
         let mut orders = self.orders.write();
         let original_len = orders.len();
@@ -239,11 +222,23 @@ impl BazaarOrderTracker {
         // don't exceed the in-game count.
         let mut kept_counts: std::collections::HashMap<(String, bool), usize> =
             std::collections::HashMap::new();
-        orders.retain(|o| {
+        orders.retain_mut(|o| {
             let key = (normalize_for_match(&o.item_name), o.is_buy_order);
             let allowed = ingame_counts.get(&key).copied().unwrap_or(0);
-            let kept = kept_counts.entry(key).or_insert(0);
+            let kept = kept_counts.entry(key.clone()).or_insert(0);
             if *kept < allowed {
+                if let Some((amount, price_per_unit)) = ingame_details
+                    .get(&key)
+                    .and_then(|rows| rows.get(*kept))
+                    .copied()
+                {
+                    if amount > 0 {
+                        o.amount = amount;
+                    }
+                    if price_per_unit > 0.0 {
+                        o.price_per_unit = price_per_unit;
+                    }
+                }
                 *kept += 1;
                 true
             } else {
@@ -265,6 +260,9 @@ impl BazaarOrderTracker {
         let mut ingame_data: std::collections::HashMap<(String, bool), Vec<(u64, f64)>> =
             std::collections::HashMap::new();
         for (name, is_buy, amount, price) in ingame_orders {
+            if !*is_buy && *amount == 0 {
+                continue;
+            }
             ingame_data
                 .entry((normalize_for_match(name), *is_buy))
                 .or_default()
@@ -308,147 +306,40 @@ impl BazaarOrderTracker {
         removed
     }
 
-    /// Record a collected buy order as its own FIFO cost lot.
+    /// Record a collected buy order's cost so that profit can be computed
+    /// when the corresponding sell offer for the same item is collected.
     ///
-    /// Older builds collapsed costs into a single weighted-average entry per
-    /// item, which allowed stale costs from previous flips to be mixed into new
-    /// sells. Keeping immutable lots makes each realized SELL consume exactly
-    /// the currently matching BUY fills.
+    /// If a buy cost already exists for this item (e.g. two buy orders filled
+    /// before a single sell offer is collected), the amounts are accumulated
+    /// and the price-per-unit is recomputed as a weighted average so that the
+    /// profit calculation accounts for **all** purchased units, not just the
+    /// last batch.
     pub fn record_buy_cost(&self, item_name: &str, price_per_unit: f64, amount: u64) {
-        if amount == 0 {
-            debug!(
-                "[BazaarTracker] Ignoring zero-amount buy-cost lot for {}",
-                item_name
-            );
-            return;
-        }
         let key = normalize_for_match(item_name);
-        let lot = BuyCostLot {
-            item: item_name.to_string(),
-            amount,
-            unit_cost: price_per_unit,
-            total_cost: price_per_unit * amount as f64,
-            timestamp: current_unix_secs(),
-            order_id: None,
+        let mut costs = self.last_buy_costs.write();
+        let entry = costs.entry(key).or_insert((0.0, 0));
+        let old_total_cost = entry.0 * entry.1 as f64;
+        let new_total_cost = price_per_unit * amount as f64;
+        let combined_amount = entry.1 + amount;
+        entry.0 = if combined_amount > 0 {
+            (old_total_cost + new_total_cost) / combined_amount as f64
+        } else {
+            0.0
         };
-        self.buy_cost_lots
+        entry.1 = combined_amount;
+        drop(costs);
+        self.save_buy_costs_to_disk();
+    }
+
+    /// Consume and return the stored buy cost for an item (if any).
+    /// Used when a sell offer is collected to compute profit/loss.
+    pub fn take_buy_cost(&self, item_name: &str) -> Option<(f64, u64)> {
+        let result = self
+            .last_buy_costs
             .write()
-            .entry(key)
-            .or_default()
-            .push_back(lot);
+            .remove(&normalize_for_match(item_name));
         self.save_buy_costs_to_disk();
-    }
-
-    /// Consume FIFO buy-cost lots for a SELL collection.
-    ///
-    /// The method is all-or-nothing: if there are no lots, or if the known lots
-    /// do not cover the full sold amount, no lot is mutated and callers must
-    /// mark the SELL as `UNKNOWN_COST_BASIS` instead of booking profit/loss.
-    pub fn consume_buy_lots_fifo(
-        &self,
-        item_name: &str,
-        amount: u64,
-    ) -> Result<ConsumedLotCosts, UnknownCostBasis> {
-        if amount == 0 {
-            return Err(UnknownCostBasis::ZeroAmount);
-        }
-
-        let key = normalize_for_match(item_name);
-        let mut lots_by_item = self.buy_cost_lots.write();
-        let lots = lots_by_item.get_mut(&key).ok_or(UnknownCostBasis::NoLots)?;
-        if lots.is_empty() {
-            return Err(UnknownCostBasis::NoLots);
-        }
-
-        let available = lots.iter().map(|lot| lot.amount).sum::<u64>();
-        if available < amount {
-            return Err(UnknownCostBasis::InsufficientLots {
-                requested: amount,
-                available,
-            });
-        }
-
-        let mut remaining = amount;
-        let mut total_cost = 0.0;
-        let mut lots_consumed = 0usize;
-
-        while remaining > 0 {
-            let front = lots.front_mut().expect("availability checked above");
-            let take = remaining.min(front.amount);
-            total_cost += front.unit_cost * take as f64;
-            front.amount -= take;
-            front.total_cost = front.unit_cost * front.amount as f64;
-            remaining -= take;
-            lots_consumed += 1;
-
-            if front.amount == 0 {
-                lots.pop_front();
-            }
-        }
-
-        if lots.is_empty() {
-            lots_by_item.remove(&key);
-        }
-        drop(lots_by_item);
-        self.save_buy_costs_to_disk();
-
-        Ok(ConsumedLotCosts {
-            amount,
-            total_cost,
-            weighted_unit_cost: total_cost / amount as f64,
-            lots_consumed,
-        })
-    }
-
-    /// Return all FIFO buy-cost lots for an item. Used by tests and diagnostics.
-    pub fn buy_cost_lots_for_item(&self, item_name: &str) -> Vec<BuyCostLot> {
-        self.buy_cost_lots
-            .read()
-            .get(&normalize_for_match(item_name))
-            .map(|lots| lots.iter().cloned().collect())
-            .unwrap_or_default()
-    }
-
-    /// Return true if any cost lots are currently persisted in memory.
-    pub fn has_buy_cost_lots(&self) -> bool {
-        self.buy_cost_lots
-            .read()
-            .values()
-            .any(|lots| !lots.is_empty())
-    }
-
-    /// Record that a SELL collection was skipped because its cost basis was unknown.
-    pub fn record_unknown_cost_basis_sell(&self) {
-        self.unknown_cost_basis_sells
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Number of skipped SELL collections with unknown cost basis this session.
-    pub fn unknown_cost_basis_sell_count(&self) -> u64 {
-        self.unknown_cost_basis_sells.load(Ordering::Relaxed)
-    }
-
-    /// Clear all buy-cost lots if doing so is safe for startup reset.
-    ///
-    /// Reset is allowed only when the tracker has no open/filled orders and the
-    /// caller has verified there are no inventory positions that could belong
-    /// to pending Bazaar flips.
-    pub fn reset_buy_cost_lots_if_safe(
-        &self,
-        inventory_empty: bool,
-    ) -> Result<usize, &'static str> {
-        if !self.orders.read().is_empty() {
-            return Err("open_or_filled_orders_exist");
-        }
-        if !inventory_empty {
-            return Err("inventory_not_empty");
-        }
-        let mut lots = self.buy_cost_lots.write();
-        let removed = lots.values().map(VecDeque::len).sum();
-        lots.clear();
-        drop(lots);
-        self.save_buy_costs_to_disk();
-        Ok(removed)
+        result
     }
 
     /// Replace the per-item profit map with data parsed from `/cofl bz l`.
@@ -468,6 +359,49 @@ impl BazaarOrderTracker {
         let key = normalize_for_match(item_name);
         let data = self.bz_list_profits.read();
         data.get(&key).map(|(total, _count)| *total)
+    }
+
+    /// Remember the target sell price for a locally scanned BUY order.
+    pub fn record_planned_local_sell(
+        &self,
+        item_name: &str,
+        sell_price_per_unit: f64,
+        item_tag: Option<String>,
+    ) {
+        self.planned_local_sells.write().insert(
+            normalize_for_match(item_name),
+            (sell_price_per_unit, item_tag, None),
+        );
+    }
+
+    /// Remember a local SELL order amount before the GUI confirmation arrives.
+    pub fn record_planned_local_sell_amount(
+        &self,
+        item_name: &str,
+        sell_price_per_unit: f64,
+        item_tag: Option<String>,
+        amount: u64,
+    ) {
+        self.planned_local_sells.write().insert(
+            normalize_for_match(item_name),
+            (sell_price_per_unit, item_tag, Some(amount)),
+        );
+    }
+
+    /// Return the remembered local SELL amount without consuming the planned sell.
+    pub fn planned_local_sell_amount(&self, item_name: &str) -> Option<u64> {
+        self.planned_local_sells
+            .read()
+            .get(&normalize_for_match(item_name))
+            .and_then(|(_, _, amount)| *amount)
+    }
+
+    /// Consume the target sell price after the corresponding BUY order is collected.
+    pub fn take_planned_local_sell(&self, item_name: &str) -> Option<(f64, Option<String>)> {
+        self.planned_local_sells
+            .write()
+            .remove(&normalize_for_match(item_name))
+            .map(|(price, tag, _)| (price, tag))
     }
 
     // ── Persistence helpers ──
@@ -503,12 +437,7 @@ impl BazaarOrderTracker {
         return;
         #[cfg(not(test))]
         {
-            let costs: HashMap<String, Vec<BuyCostLot>> = self
-                .buy_cost_lots
-                .read()
-                .iter()
-                .map(|(item, lots)| (item.clone(), lots.iter().cloned().collect()))
-                .collect();
+            let costs = self.last_buy_costs.read().clone();
             let path = Self::persistence_dir().join(BUY_COSTS_FILE);
             if let Err(e) = std::fs::create_dir_all(Self::persistence_dir()) {
                 warn!("[BazaarTracker] Failed to create persistence dir: {}", e);
@@ -550,17 +479,10 @@ impl BazaarOrderTracker {
         let costs_path = Self::persistence_dir().join(BUY_COSTS_FILE);
         if costs_path.exists() {
             match std::fs::read_to_string(&costs_path) {
-                Ok(json) => match serde_json::from_str::<HashMap<String, Vec<BuyCostLot>>>(&json) {
+                Ok(json) => match serde_json::from_str::<HashMap<String, (f64, u64)>>(&json) {
                     Ok(costs) => {
-                        let normalized: HashMap<String, VecDeque<BuyCostLot>> = costs
-                            .into_iter()
-                            .map(|(item, lots)| (normalize_for_match(&item), lots.into()))
-                            .collect();
-                        debug!(
-                            "[BazaarTracker] Loaded {} buy-cost lot item groups from disk",
-                            normalized.len()
-                        );
-                        *self.buy_cost_lots.write() = normalized;
+                        debug!("[BazaarTracker] Loaded {} buy costs from disk", costs.len());
+                        *self.last_buy_costs.write() = costs;
                     }
                     Err(e) => warn!(
                         "[BazaarTracker] Failed to parse {}: {}",
@@ -575,22 +497,7 @@ impl BazaarOrderTracker {
                 ),
             }
         }
-
-        let legacy_costs_path = Self::persistence_dir().join(LEGACY_BUY_COSTS_FILE);
-        if legacy_costs_path.exists() && !costs_path.exists() {
-            warn!(
-                "[BazaarTracker] Found legacy {} but did not migrate it; old weighted-average costs are ignored to avoid mixing stale cost basis into new sells",
-                legacy_costs_path.display()
-            );
-        }
     }
-}
-
-fn current_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 fn normalize_for_match(name: &str) -> String {
@@ -708,106 +615,73 @@ mod tests {
     }
 
     #[test]
-    fn record_buy_cost_creates_one_lot() {
+    fn record_and_take_buy_cost() {
         let tracker = BazaarOrderTracker::new_in_memory();
         tracker.record_buy_cost("Enchanted Coal Block", 500.0, 10);
 
-        let lots = tracker.buy_cost_lots_for_item("Enchanted Coal Block");
-        assert_eq!(lots.len(), 1);
-        assert_eq!(lots[0].item, "Enchanted Coal Block");
-        assert_eq!(lots[0].amount, 10);
-        assert_eq!(lots[0].unit_cost, 500.0);
-        assert_eq!(lots[0].total_cost, 5_000.0);
+        let cost = tracker.take_buy_cost("Enchanted Coal Block");
+        assert!(cost.is_some());
+        let (ppu, amt) = cost.unwrap();
+        assert_eq!(ppu, 500.0);
+        assert_eq!(amt, 10);
+
+        // Second take returns None (consumed).
+        assert!(tracker.take_buy_cost("Enchanted Coal Block").is_none());
     }
 
     #[test]
-    fn consume_buy_lots_case_insensitive() {
+    fn take_buy_cost_case_insensitive() {
         let tracker = BazaarOrderTracker::new_in_memory();
         tracker.record_buy_cost("Enchanted Coal Block", 500.0, 10);
-        assert!(
-            tracker
-                .consume_buy_lots_fifo("enchanted coal block", 10)
-                .is_ok()
-        );
+        assert!(tracker.take_buy_cost("enchanted coal block").is_some());
     }
 
     #[test]
-    fn consume_buy_lots_returns_unknown_when_missing() {
+    fn take_buy_cost_returns_none_when_missing() {
         let tracker = BazaarOrderTracker::new_in_memory();
-        assert_eq!(
-            tracker.consume_buy_lots_fifo("Nonexistent", 1),
-            Err(UnknownCostBasis::NoLots)
-        );
+        assert!(tracker.take_buy_cost("Nonexistent").is_none());
     }
 
     #[test]
-    fn sell_profit_from_fifo_buy_cost() {
+    fn sell_profit_from_recorded_buy_cost() {
         let tracker = BazaarOrderTracker::new_in_memory();
+        // Simulate buy order collected: 10x Coal @ 500 coins/unit
         tracker.record_buy_cost("Coal", 500.0, 10);
-
+        // Simulate sell offer collected: 10x Coal @ 600 coins/unit
         let sell_ppu = 600.0;
         let sell_amount = 10u64;
-        let consumed = tracker.consume_buy_lots_fifo("Coal", sell_amount).unwrap();
-        let profit = (sell_ppu * sell_amount as f64) - consumed.total_cost;
+        let (buy_ppu, buy_amount) = tracker.take_buy_cost("Coal").unwrap();
+        let profit = (sell_ppu * sell_amount as f64) - (buy_ppu * buy_amount as f64);
         assert_eq!(profit, 1000.0);
-        assert!(tracker.buy_cost_lots_for_item("Coal").is_empty());
     }
 
     #[test]
-    fn multiple_buy_orders_are_consumed_fifo() {
+    fn multiple_buy_orders_accumulate_cost() {
         let tracker = BazaarOrderTracker::new_in_memory();
+        // Two buy orders for the same item collected before the sell
         tracker.record_buy_cost("Coal", 500.0, 10);
-        tracker.record_buy_cost("Coal", 700.0, 10);
-
-        let consumed = tracker.consume_buy_lots_fifo("Coal", 15).unwrap();
-        assert_eq!(consumed.amount, 15);
-        assert_eq!(consumed.total_cost, 8_500.0);
-        assert!((consumed.weighted_unit_cost - 566.6666667).abs() < 0.01);
-
-        let remaining = tracker.buy_cost_lots_for_item("Coal");
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].amount, 5);
-        assert_eq!(remaining[0].unit_cost, 700.0);
-        assert_eq!(remaining[0].total_cost, 3_500.0);
+        tracker.record_buy_cost("Coal", 500.0, 10);
+        // Sell 20x Coal @ 600 coins/unit
+        let (buy_ppu, buy_amount) = tracker.take_buy_cost("Coal").unwrap();
+        assert_eq!(buy_amount, 20);
+        assert!((buy_ppu - 500.0).abs() < 0.01);
+        let sell_total = 600.0 * 20.0;
+        let buy_total = buy_ppu * buy_amount as f64;
+        let profit = sell_total - buy_total;
+        // Expected: (600*20) - (500*20) = 12000 - 10000 = 2000
+        assert_eq!(profit, 2000.0);
     }
 
     #[test]
-    fn consume_buy_lots_is_all_or_nothing_when_insufficient() {
+    fn multiple_buy_orders_weighted_average() {
         let tracker = BazaarOrderTracker::new_in_memory();
+        // Buy 10 @ 500/unit, then 10 @ 510/unit
         tracker.record_buy_cost("Diamond", 500.0, 10);
-
-        assert_eq!(
-            tracker.consume_buy_lots_fifo("Diamond", 11),
-            Err(UnknownCostBasis::InsufficientLots {
-                requested: 11,
-                available: 10,
-            })
-        );
-
-        let remaining = tracker.buy_cost_lots_for_item("Diamond");
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].amount, 10);
-    }
-
-    #[test]
-    fn reset_buy_cost_lots_requires_no_orders_and_empty_inventory() {
-        let tracker = BazaarOrderTracker::new_in_memory();
-        tracker.record_buy_cost("Diamond", 500.0, 10);
-        assert_eq!(
-            tracker.reset_buy_cost_lots_if_safe(false),
-            Err("inventory_not_empty")
-        );
-        assert!(tracker.has_buy_cost_lots());
-
-        tracker.add_order("Diamond".into(), 10, 500.0, true);
-        assert_eq!(
-            tracker.reset_buy_cost_lots_if_safe(true),
-            Err("open_or_filled_orders_exist")
-        );
-        tracker.remove_order("Diamond", true);
-
-        assert_eq!(tracker.reset_buy_cost_lots_if_safe(true), Ok(1));
-        assert!(!tracker.has_buy_cost_lots());
+        tracker.record_buy_cost("Diamond", 510.0, 10);
+        let (buy_ppu, buy_amount) = tracker.take_buy_cost("Diamond").unwrap();
+        assert_eq!(buy_amount, 20);
+        // Weighted avg = (500*10 + 510*10) / 20 = 10100 / 20 = 505
+        assert!((buy_ppu - 505.0).abs() < 0.01);
     }
 
     #[test]
@@ -827,16 +701,12 @@ mod tests {
         assert_eq!(removed, 1);
         let remaining = tracker.get_orders();
         assert_eq!(remaining.len(), 2);
-        assert!(
-            remaining
-                .iter()
-                .any(|o| o.item_name == "Coal" && o.is_buy_order)
-        );
-        assert!(
-            remaining
-                .iter()
-                .any(|o| o.item_name == "Diamond" && !o.is_buy_order)
-        );
+        assert!(remaining
+            .iter()
+            .any(|o| o.item_name == "Coal" && o.is_buy_order));
+        assert!(remaining
+            .iter()
+            .any(|o| o.item_name == "Diamond" && !o.is_buy_order));
     }
 
     #[test]

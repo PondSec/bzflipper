@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::sync::{
-    atomic::{AtomicBool, AtomicI64, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 
@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
-use crate::bot::BotClient;
 use crate::bazaar_tracker::BazaarOrderTracker;
+use crate::bot::BotClient;
 use crate::logging::print_mc_chat;
 use crate::state::CommandQueue;
 use crate::types::{CommandPriority, CommandType};
@@ -70,8 +70,6 @@ pub struct WebSharedState {
     pub detected_cofl_license: Arc<std::sync::atomic::AtomicU32>,
     /// Shared profit tracker for AH and Bazaar realized profits.
     pub profit_tracker: Arc<crate::profit::ProfitTracker>,
-    /// Local lot-accounted Bazaar profit total used by the web graph.
-    pub bz_local_profit_total: Arc<AtomicI64>,
     /// Session-only anonymize toggle for the web panel (defaults to OFF).
     /// Not persisted to config — resets to OFF on each process start.
     pub anonymize_webhook_name: Arc<AtomicBool>,
@@ -158,11 +156,12 @@ struct ProfitResponse {
     ah_total: i64,
     bz_total: i64,
     uptime_seconds: u64,
-    bz_unknown_cost_basis: bool,
 }
 
 /// Default auction duration used when the client doesn't provide one.
-fn default_auction_duration() -> u64 { 24 }
+fn default_auction_duration() -> u64 {
+    24
+}
 
 /// Public (unauthenticated) profit summary — no IGN, no account info.
 /// Used by the login page and OpenGraph embeds.
@@ -175,7 +174,6 @@ struct PublicProfitResponse {
     uptime_seconds: u64,
     ah_points: Vec<(u64, i64)>,
     bz_points: Vec<(u64, i64)>,
-    bz_unknown_cost_basis: bool,
 }
 
 #[derive(Serialize)]
@@ -213,11 +211,7 @@ fn extract_session_cookie(req: &Request) -> Option<String> {
 
 /// Middleware logic that enforces authentication when a password is configured.
 /// Allows unauthenticated access to `GET /` (panel HTML) and `POST /api/login`.
-async fn check_auth(
-    s: WebSharedState,
-    req: Request,
-    next: Next,
-) -> Response {
+async fn check_auth(s: WebSharedState, req: Request, next: Next) -> Response {
     // No password configured → skip auth entirely
     if s.web_gui_password.as_ref().map_or(true, |p| p.is_empty()) {
         return next.run(req).await;
@@ -295,17 +289,26 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/game-view", get(get_game_view))
         .route("/api/toggle_ah", axum::routing::post(toggle_ah))
         .route("/api/toggle_bazaar", axum::routing::post(toggle_bazaar))
-        .route("/api/toggle_anonymize", axum::routing::post(toggle_anonymize))
+        .route(
+            "/api/toggle_anonymize",
+            axum::routing::post(toggle_anonymize),
+        )
         .route("/api/chat/send", axum::routing::post(send_chat))
         .route("/api/chat/ws", get(chat_ws_handler))
         .route("/api/switch_account", axum::routing::post(switch_account))
         .route("/api/cancel_auction", axum::routing::post(cancel_auction))
         .route("/api/list_item", axum::routing::post(list_item))
         .route("/api/claim_purchases", axum::routing::post(claim_purchases))
-        .route("/api/collect_bz_orders", axum::routing::post(collect_bz_orders))
+        .route(
+            "/api/collect_bz_orders",
+            axum::routing::post(collect_bz_orders),
+        )
         .route("/api/claim_bz_orders", axum::routing::post(claim_bz_orders))
         .route("/api/cancel_bz_order", axum::routing::post(cancel_bz_order))
-        .route("/api/cancel_all_bz_orders", axum::routing::post(cancel_all_bz_orders))
+        .route(
+            "/api/cancel_all_bz_orders",
+            axum::routing::post(cancel_all_bz_orders),
+        )
         .route("/api/auctions", get(get_auctions))
         .route("/api/bazaar_orders", get(get_bazaar_orders))
         .route("/api/queue", get(get_queue_status))
@@ -315,10 +318,12 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/kill_session", axum::routing::post(kill_session))
         .route("/api/disconnect", axum::routing::post(disconnect_session))
         .route("/api/connect", axum::routing::post(connect_session))
-        .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
-            let s = auth_state.clone();
-            async move { check_auth(s, req, next).await }
-        }))
+        .layer(axum::middleware::from_fn(
+            move |req: Request, next: Next| {
+                let s = auth_state.clone();
+                async move { check_auth(s, req, next).await }
+            },
+        ))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
@@ -379,12 +384,15 @@ fn format_og_uptime(secs: u64) -> String {
 }
 
 async fn index_page(State(s): State<WebSharedState>) -> Html<String> {
-    let (ah_total, _bz_total) = s.profit_tracker.totals();
-    let bz_total = s.bz_local_profit_total.load(Ordering::Relaxed);
+    let (ah_total, bz_total) = s.profit_tracker.totals();
     let total = ah_total + bz_total;
     let uptime = s.previous_session_secs + s.started_at.elapsed().as_secs();
     let hours = uptime as f64 / 3600.0;
-    let per_hour = if hours > 0.0 { total as f64 / hours } else { 0.0 };
+    let per_hour = if hours > 0.0 {
+        total as f64 / hours
+    } else {
+        0.0
+    };
 
     let og_title = "Frikadellen BAF — Control Panel";
     let og_description = format!(
@@ -407,8 +415,7 @@ async fn index_page(State(s): State<WebSharedState>) -> Html<String> {
          <meta name=\"theme-color\" content=\"#6c5ce7\">",
     );
 
-    let html = include_str!("panel.html")
-        .replacen("<!-- OG_META_TAGS -->", &og_tags, 1);
+    let html = include_str!("panel.html").replacen("<!-- OG_META_TAGS -->", &og_tags, 1);
 
     Html(html)
 }
@@ -477,11 +484,17 @@ async fn get_status(State(s): State<WebSharedState>) -> Json<StatusResponse> {
     let (current_account, accounts) = if anonymize {
         let hidden = "Hidden".to_string();
         let anon_accounts: Vec<String> = s.ingame_names.iter().map(|_| hidden.clone()).collect();
-        let anon_current = anon_accounts.get(s.current_account_index).cloned().unwrap_or_default();
+        let anon_current = anon_accounts
+            .get(s.current_account_index)
+            .cloned()
+            .unwrap_or_default();
         (anon_current, anon_accounts)
     } else {
         (
-            s.ingame_names.get(s.current_account_index).cloned().unwrap_or_default(),
+            s.ingame_names
+                .get(s.current_account_index)
+                .cloned()
+                .unwrap_or_default(),
             s.ingame_names.clone(),
         )
     };
@@ -532,7 +545,11 @@ async fn get_inventory(State(s): State<WebSharedState>) -> impl IntoResponse {
 async fn get_game_view(State(s): State<WebSharedState>) -> impl IntoResponse {
     match s.bot_client.get_cached_window_json() {
         Some(json) => (StatusCode::OK, json),
-        None => (StatusCode::OK, r#"{"open":false,"botState":"Unknown","windowId":null,"title":null,"slots":[]}"#.to_string()),
+        None => (
+            StatusCode::OK,
+            r#"{"open":false,"botState":"Unknown","windowId":null,"title":null,"slots":[]}"#
+                .to_string(),
+        ),
     }
 }
 
@@ -542,7 +559,14 @@ async fn toggle_ah(
 ) -> impl IntoResponse {
     s.enable_ah_flips.store(payload.enabled, Ordering::Relaxed);
     info!("[WebGUI] AH flips set to {} via web panel", payload.enabled);
-    let msg = format!("[BAF Web] AH flips {}", if payload.enabled { "enabled" } else { "disabled" });
+    let msg = format!(
+        "[BAF Web] AH flips {}",
+        if payload.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
     // Persist to config file
@@ -550,7 +574,10 @@ async fn toggle_ah(
     let loader = s.config_loader.clone();
     tokio::task::spawn_blocking(move || {
         if let Err(e) = loader.update_property(|c| c.enable_ah_flips = enabled) {
-            error!("[WebGUI] Failed to persist AH flips toggle to config: {}", e);
+            error!(
+                "[WebGUI] Failed to persist AH flips toggle to config: {}",
+                e
+            );
         }
     });
     StatusCode::OK
@@ -560,9 +587,20 @@ async fn toggle_bazaar(
     State(s): State<WebSharedState>,
     Json(payload): Json<TogglePayload>,
 ) -> impl IntoResponse {
-    s.enable_bazaar_flips.store(payload.enabled, Ordering::Relaxed);
-    info!("[WebGUI] Bazaar flips set to {} via web panel", payload.enabled);
-    let msg = format!("[BAF Web] Bazaar flips {}", if payload.enabled { "enabled" } else { "disabled" });
+    s.enable_bazaar_flips
+        .store(payload.enabled, Ordering::Relaxed);
+    info!(
+        "[WebGUI] Bazaar flips set to {} via web panel",
+        payload.enabled
+    );
+    let msg = format!(
+        "[BAF Web] Bazaar flips {}",
+        if payload.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
     // Persist to config file
@@ -570,7 +608,10 @@ async fn toggle_bazaar(
     let loader = s.config_loader.clone();
     tokio::task::spawn_blocking(move || {
         if let Err(e) = loader.update_property(|c| c.enable_bazaar_flips = enabled) {
-            error!("[WebGUI] Failed to persist Bazaar flips toggle to config: {}", e);
+            error!(
+                "[WebGUI] Failed to persist Bazaar flips toggle to config: {}",
+                e
+            );
         }
     });
     StatusCode::OK
@@ -580,9 +621,20 @@ async fn toggle_anonymize(
     State(s): State<WebSharedState>,
     Json(payload): Json<TogglePayload>,
 ) -> impl IntoResponse {
-    s.anonymize_webhook_name.store(payload.enabled, Ordering::Relaxed);
-    info!("[WebGUI] Anonymize set to {} via web panel", payload.enabled);
-    let msg = format!("[BAF Web] Anonymize {}", if payload.enabled { "enabled" } else { "disabled" });
+    s.anonymize_webhook_name
+        .store(payload.enabled, Ordering::Relaxed);
+    info!(
+        "[WebGUI] Anonymize set to {} via web panel",
+        payload.enabled
+    );
+    let msg = format!(
+        "[BAF Web] Anonymize {}",
+        if payload.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
     StatusCode::OK
@@ -677,7 +729,9 @@ async fn switch_account(
         .send(format!("[BAF Web] Switching to account {}...", next_name));
 
     // Transfer the COFL license to the next account before restarting.
-    let license_index = s.detected_cofl_license.load(std::sync::atomic::Ordering::Relaxed);
+    let license_index = s
+        .detected_cofl_license
+        .load(std::sync::atomic::Ordering::Relaxed);
     let ws = s.ws_client.clone();
     let target_name = next_name.clone();
 
@@ -707,10 +761,7 @@ async fn cancel_auction(
         payload.item_name, payload.starting_bid
     );
 
-    let msg = format!(
-        "[BAF Web] Cancelling auction: {}...",
-        payload.item_name
-    );
+    let msg = format!("[BAF Web] Cancelling auction: {}...", payload.item_name);
     print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
 
@@ -732,7 +783,11 @@ async fn list_item(
 ) -> impl IntoResponse {
     // Basic validation
     if payload.starting_bid == 0 {
-        return (StatusCode::BAD_REQUEST, "Starting bid must be greater than 0").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "Starting bid must be greater than 0",
+        )
+            .into_response();
     }
     // Clamp to Hypixel's maximum auction duration of 7 days (168 hours).
     let duration = payload.duration_hours.clamp(1, 168);
@@ -764,9 +819,7 @@ async fn list_item(
     (StatusCode::OK, "List item command queued").into_response()
 }
 
-async fn claim_purchases(
-    State(s): State<WebSharedState>,
-) -> impl IntoResponse {
+async fn claim_purchases(State(s): State<WebSharedState>) -> impl IntoResponse {
     info!("[WebGUI] Claim purchases requested");
 
     let msg = "[BAF Web] Checking unclaimed purchases...".to_string();
@@ -782,9 +835,7 @@ async fn claim_purchases(
     (StatusCode::OK, "Claim purchases command queued")
 }
 
-async fn collect_bz_orders(
-    State(s): State<WebSharedState>,
-) -> impl IntoResponse {
+async fn collect_bz_orders(State(s): State<WebSharedState>) -> impl IntoResponse {
     info!("[WebGUI] Sell inventory instantly on bazaar requested");
 
     let msg = "[BAF Web] Selling inventory on bazaar...".to_string();
@@ -800,9 +851,7 @@ async fn collect_bz_orders(
     (StatusCode::OK, "Sell inventory on bazaar command queued")
 }
 
-async fn claim_bz_orders(
-    State(s): State<WebSharedState>,
-) -> impl IntoResponse {
+async fn claim_bz_orders(State(s): State<WebSharedState>) -> impl IntoResponse {
     info!("[WebGUI] Force claim bazaar orders requested");
 
     let msg = "[BAF Web] Checking and claiming bazaar orders...".to_string();
@@ -810,7 +859,10 @@ async fn claim_bz_orders(
     let _ = s.chat_tx.send(msg);
 
     s.command_queue.enqueue(
-        CommandType::ManageOrders { cancel_open: false, target_item: None },
+        CommandType::ManageOrders {
+            cancel_open: false,
+            target_item: None,
+        },
         CommandPriority::Critical,
         false,
     );
@@ -838,7 +890,8 @@ async fn cancel_bz_order(
     // Remove the order from the tracker immediately so the web GUI reflects
     // the intent.  The in-game cancellation happens asynchronously via
     // ManageOrders targeting this specific order.
-    s.bazaar_tracker.remove_order(&payload.item_name, payload.is_buy_order);
+    s.bazaar_tracker
+        .remove_order(&payload.item_name, payload.is_buy_order);
 
     s.command_queue.enqueue(
         CommandType::ManageOrders {
@@ -852,9 +905,7 @@ async fn cancel_bz_order(
     (StatusCode::OK, "Cancel bazaar order command queued")
 }
 
-async fn cancel_all_bz_orders(
-    State(s): State<WebSharedState>,
-) -> impl IntoResponse {
+async fn cancel_all_bz_orders(State(s): State<WebSharedState>) -> impl IntoResponse {
     info!("[WebGUI] Cancel ALL bazaar orders requested");
 
     let msg = "[BAF Web] Cancelling all bazaar orders...".to_string();
@@ -867,7 +918,10 @@ async fn cancel_all_bz_orders(
 
     // Queue a ManageOrders cycle with cancel_open=true to cancel in-game orders.
     s.command_queue.enqueue(
-        CommandType::ManageOrders { cancel_open: true, target_item: None },
+        CommandType::ManageOrders {
+            cancel_open: true,
+            target_item: None,
+        },
         CommandPriority::Critical,
         false,
     );
@@ -923,7 +977,10 @@ async fn disconnect_session(State(s): State<WebSharedState>) -> impl IntoRespons
     // Disconnect the bot from Hypixel (logs + parks state in Idle)
     s.bot_client.disconnect();
 
-    (StatusCode::OK, "Disconnected: flip intake paused, queue cleared, COFL closed")
+    (
+        StatusCode::OK,
+        "Disconnected: flip intake paused, queue cleared, COFL closed",
+    )
 }
 
 async fn connect_session(State(s): State<WebSharedState>) -> impl IntoResponse {
@@ -991,20 +1048,27 @@ async fn get_auctions(State(s): State<WebSharedState>) -> impl IntoResponse {
                     // Only include active auctions
                     a.get("status").and_then(|s| s.as_str()).unwrap_or("") == "active"
                 })
-                .map(|a| {
-                    AuctionEntry {
-                        uuid: String::new(),
-                        item_name: a.get("item_name").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string(),
-                        tag: a.get("tag").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        highest_bid: a.get("highest_bid").and_then(|v| v.as_i64()).unwrap_or(0),
-                        starting_bid: a.get("starting_bid").and_then(|v| v.as_i64()).unwrap_or(0),
-                        bin: a.get("bin").and_then(|v| v.as_bool()).unwrap_or(false),
-                        end: String::new(),
-                        time_remaining_seconds: a.get("time_remaining_seconds").and_then(|v| v.as_i64()).unwrap_or(0),
-                        lore: a.get("lore").and_then(|v| v.as_array()).map(|arr| {
-                            arr.iter().filter_map(|l| l.as_str().map(|s| s.to_string())).collect()
-                        }),
-                    }
+                .map(|a| AuctionEntry {
+                    uuid: String::new(),
+                    item_name: a
+                        .get("item_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown")
+                        .to_string(),
+                    tag: a.get("tag").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    highest_bid: a.get("highest_bid").and_then(|v| v.as_i64()).unwrap_or(0),
+                    starting_bid: a.get("starting_bid").and_then(|v| v.as_i64()).unwrap_or(0),
+                    bin: a.get("bin").and_then(|v| v.as_bool()).unwrap_or(false),
+                    end: String::new(),
+                    time_remaining_seconds: a
+                        .get("time_remaining_seconds")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0),
+                    lore: a.get("lore").and_then(|v| v.as_array()).map(|arr| {
+                        arr.iter()
+                            .filter_map(|l| l.as_str().map(|s| s.to_string()))
+                            .collect()
+                    }),
                 })
                 .collect();
             if !entries.is_empty() {
@@ -1075,11 +1139,17 @@ async fn get_auctions(State(s): State<WebSharedState>) -> impl IntoResponse {
             Ok(resp) if resp.status().is_success() => {
                 match resp.json::<serde_json::Value>().await {
                     Ok(data) => {
-                        if data.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        if data
+                            .get("success")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                        {
                             let entries = parse_hypixel_auctions(&data);
                             return Json(entries).into_response();
                         }
-                        warn!("[WebGUI] Hypixel API returned success=false, falling back to Coflnet");
+                        warn!(
+                            "[WebGUI] Hypixel API returned success=false, falling back to Coflnet"
+                        );
                     }
                     Err(e) => {
                         warn!("[WebGUI] Failed to parse Hypixel auction response: {}", e);
@@ -1087,7 +1157,10 @@ async fn get_auctions(State(s): State<WebSharedState>) -> impl IntoResponse {
                 }
             }
             Ok(resp) => {
-                warn!("[WebGUI] Hypixel API returned status {}, falling back to Coflnet", resp.status());
+                warn!(
+                    "[WebGUI] Hypixel API returned status {}, falling back to Coflnet",
+                    resp.status()
+                );
             }
             Err(e) => {
                 warn!("[WebGUI] Failed to fetch auctions from Hypixel: {}", e);
@@ -1096,10 +1169,7 @@ async fn get_auctions(State(s): State<WebSharedState>) -> impl IntoResponse {
     }
 
     // Fallback: Fetch auctions from Coflnet
-    let url = format!(
-        "https://sky.coflnet.com/api/player/{}/auctions",
-        uuid
-    );
+    let url = format!("https://sky.coflnet.com/api/player/{}/auctions", uuid);
 
     let resp = match client.get(&url).send().await {
         Ok(r) => r,
@@ -1129,7 +1199,10 @@ async fn get_auctions(State(s): State<WebSharedState>) -> impl IntoResponse {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or_else(|e| {
-            warn!("[WebGUI] System clock appears to be before Unix epoch: {}", e);
+            warn!(
+                "[WebGUI] System clock appears to be before Unix epoch: {}",
+                e
+            );
             0
         });
 
@@ -1143,7 +1216,10 @@ async fn get_auctions(State(s): State<WebSharedState>) -> impl IntoResponse {
             let end_secs = match chrono::DateTime::parse_from_rfc3339(end_str) {
                 Ok(dt) => dt.timestamp(),
                 Err(e) => {
-                    warn!("[WebGUI] Skipping auction with invalid end timestamp '{}': {}", end_str, e);
+                    warn!(
+                        "[WebGUI] Skipping auction with invalid end timestamp '{}': {}",
+                        end_str, e
+                    );
                     return None;
                 }
             };
@@ -1198,7 +1274,9 @@ async fn get_auctions(State(s): State<WebSharedState>) -> impl IntoResponse {
 
 // ── Bazaar orders endpoint ──────────────────────────────────
 
-async fn get_bazaar_orders(State(s): State<WebSharedState>) -> Json<Vec<crate::bazaar_tracker::TrackedBazaarOrder>> {
+async fn get_bazaar_orders(
+    State(s): State<WebSharedState>,
+) -> Json<Vec<crate::bazaar_tracker::TrackedBazaarOrder>> {
     Json(s.bazaar_tracker.get_orders())
 }
 
@@ -1212,18 +1290,18 @@ async fn get_queue_status(State(s): State<WebSharedState>) -> Json<Vec<crate::st
 
 async fn get_config(State(s): State<WebSharedState>) -> impl IntoResponse {
     let loader = s.config_loader.clone();
-    match tokio::task::spawn_blocking(move || {
-        loader.load()
-    }).await {
-        Ok(Ok(config)) => {
-            match toml::to_string_pretty(&config) {
-                Ok(toml_str) => (StatusCode::OK, toml_str).into_response(),
-                Err(e) => {
-                    error!("[WebGUI] Failed to serialize config: {}", e);
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Failed to serialize config").into_response()
-                }
+    match tokio::task::spawn_blocking(move || loader.load()).await {
+        Ok(Ok(config)) => match toml::to_string_pretty(&config) {
+            Ok(toml_str) => (StatusCode::OK, toml_str).into_response(),
+            Err(e) => {
+                error!("[WebGUI] Failed to serialize config: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to serialize config",
+                )
+                    .into_response()
             }
-        }
+        },
         Ok(Err(e)) => {
             error!("[WebGUI] Failed to load config: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load config").into_response()
@@ -1250,14 +1328,18 @@ async fn save_config(
     let toml_str = payload.config_toml;
     match tokio::task::spawn_blocking(move || -> Result<(), String> {
         // Parse the TOML to validate it first
-        let config: crate::config::Config = toml::from_str(&toml_str)
-            .map_err(|e| format!("Invalid config TOML: {}", e))?;
+        let config: crate::config::Config =
+            toml::from_str(&toml_str).map_err(|e| format!("Invalid config TOML: {}", e))?;
         // Update in-memory toggle flags to match the saved config
         enable_ah.store(config.enable_ah_flips, Ordering::Relaxed);
         enable_bz.store(config.enable_bazaar_flips, Ordering::Relaxed);
         // Save validated config
-        loader.save(&config).map_err(|e| format!("Failed to save config: {}", e))
-    }).await {
+        loader
+            .save(&config)
+            .map_err(|e| format!("Failed to save config: {}", e))
+    })
+    .await
+    {
         Ok(Ok(())) => {
             info!("[WebGUI] Config saved via web panel");
             let msg = "[BAF Web] Config saved".to_string();
@@ -1271,7 +1353,11 @@ async fn save_config(
         }
         Err(e) => {
             error!("[WebGUI] Config save task panicked: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string()).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error".to_string(),
+            )
+                .into_response()
         }
     }
 }
@@ -1290,7 +1376,11 @@ fn parse_hypixel_auctions(data: &serde_json::Value) -> Vec<AuctionEntry> {
         .iter()
         .filter_map(|auction| {
             // Skip claimed auctions
-            if auction.get("claimed").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if auction
+                .get("claimed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 return None;
             }
             let end_ms = auction.get("end").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -1351,7 +1441,13 @@ fn derive_item_tag(item_name: &str) -> Option<String> {
     Some(
         item_name
             .chars()
-            .map(|c| if c.is_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
             .collect::<String>()
             .trim_matches('_')
             .to_string(),
@@ -1366,7 +1462,10 @@ async fn download_latest_log() -> impl IntoResponse {
     match tokio::fs::read(&log_path).await {
         Ok(contents) => {
             let headers = [
-                (axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8",
+                ),
                 (
                     axum::http::header::CONTENT_DISPOSITION,
                     "attachment; filename=\"latest.log\"",
@@ -1388,15 +1487,13 @@ async fn download_latest_log() -> impl IntoResponse {
 // ── WebSocket handler for live chat ──────────────────────────
 
 async fn get_profit(State(s): State<WebSharedState>) -> Json<ProfitResponse> {
-    let (ah_total, _bz_total) = s.profit_tracker.totals();
-    let bz_total = s.bz_local_profit_total.load(Ordering::Relaxed);
+    let (ah_total, bz_total) = s.profit_tracker.totals();
     Json(ProfitResponse {
         ah_points: s.profit_tracker.ah_points(),
         bz_points: s.profit_tracker.bz_points(),
         ah_total,
         bz_total,
         uptime_seconds: s.previous_session_secs + s.started_at.elapsed().as_secs(),
-        bz_unknown_cost_basis: s.bazaar_tracker.unknown_cost_basis_sell_count() > 0,
     })
 }
 
@@ -1404,12 +1501,15 @@ async fn get_profit(State(s): State<WebSharedState>) -> Json<ProfitResponse> {
 /// Returns anonymized profit data (no IGN, no account info) for the
 /// login page display and OpenGraph embeds.
 async fn get_profit_public(State(s): State<WebSharedState>) -> Json<PublicProfitResponse> {
-    let (ah_total, _bz_total) = s.profit_tracker.totals();
-    let bz_total = s.bz_local_profit_total.load(Ordering::Relaxed);
+    let (ah_total, bz_total) = s.profit_tracker.totals();
     let total = ah_total + bz_total;
     let uptime = s.previous_session_secs + s.started_at.elapsed().as_secs();
     let hours = uptime as f64 / 3600.0;
-    let per_hour = if hours > 0.0 { total as f64 / hours } else { 0.0 };
+    let per_hour = if hours > 0.0 {
+        total as f64 / hours
+    } else {
+        0.0
+    };
     Json(PublicProfitResponse {
         ah_total,
         bz_total,
@@ -1418,19 +1518,21 @@ async fn get_profit_public(State(s): State<WebSharedState>) -> Json<PublicProfit
         uptime_seconds: uptime,
         ah_points: s.profit_tracker.ah_points(),
         bz_points: s.profit_tracker.bz_points(),
-        bz_unknown_cost_basis: s.bazaar_tracker.unknown_cost_basis_sell_count() > 0,
     })
 }
 
 /// Public OG image endpoint — no authentication required.
 /// Generates a 1200×630 PNG stats card for Discord / social media embeds.
 async fn get_og_image(State(s): State<WebSharedState>) -> impl IntoResponse {
-    let (ah_total, _bz_total) = s.profit_tracker.totals();
-    let bz_total = s.bz_local_profit_total.load(Ordering::Relaxed);
+    let (ah_total, bz_total) = s.profit_tracker.totals();
     let total = ah_total + bz_total;
     let uptime = s.previous_session_secs + s.started_at.elapsed().as_secs();
     let hours = uptime as f64 / 3600.0;
-    let per_hour = if hours > 0.0 { total as f64 / hours } else { 0.0 };
+    let per_hour = if hours > 0.0 {
+        total as f64 / hours
+    } else {
+        0.0
+    };
 
     let ah_pts = s.profit_tracker.ah_points();
     let bz_pts = s.profit_tracker.bz_points();
@@ -1440,10 +1542,7 @@ async fn get_og_image(State(s): State<WebSharedState>) -> impl IntoResponse {
         StatusCode::OK,
         [
             (axum::http::header::CONTENT_TYPE, "image/png"),
-            (
-                axum::http::header::CACHE_CONTROL,
-                "public, max-age=30",
-            ),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=30"),
         ],
         png,
     )
@@ -1488,8 +1587,14 @@ mod tests {
 
     #[test]
     fn derive_tag_from_item_name() {
-        assert_eq!(derive_item_tag("Aspect of the End"), Some("ASPECT_OF_THE_END".to_string()));
-        assert_eq!(derive_item_tag("Mithril Drill SX-R326"), Some("MITHRIL_DRILL_SX_R326".to_string()));
+        assert_eq!(
+            derive_item_tag("Aspect of the End"),
+            Some("ASPECT_OF_THE_END".to_string())
+        );
+        assert_eq!(
+            derive_item_tag("Mithril Drill SX-R326"),
+            Some("MITHRIL_DRILL_SX_R326".to_string())
+        );
         assert_eq!(derive_item_tag(""), None);
         assert_eq!(derive_item_tag("Unknown"), None);
     }

@@ -191,8 +191,6 @@ a{color:var(--accent2);text-decoration:none}
 .profit-stat-box{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:clamp(18px,2vw,28px);text-align:center}
 .profit-stat-box .label{font-size:clamp(.78rem,.9vw,.92rem);color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
 .profit-stat-box .value{font-size:clamp(1.6rem,2.5vw,2.4rem);font-weight:700;color:var(--success)}
-.profit-note{font-size:.82rem;color:var(--text-dim);line-height:1.4;margin-top:8px}
-.profit-note.warn{color:var(--warning)}
 /* Config GUI */
 .cfg-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}
 .cfg-row:last-child{border-bottom:none}
@@ -319,6 +317,14 @@ a{color:var(--accent2);text-decoration:none}
             <span class="toggle-label">Anonymize</span>
             <label class="toggle"><input type="checkbox" id="tog-anon" onchange="toggleAnonymize(this.checked)"><span class="slider"></span></label>
         </div>
+        <div class="toggle-row">
+            <span class="toggle-label">Auction House Flipper</span>
+            <label class="toggle"><input type="checkbox" id="tog-ah" onchange="toggleAhFlips(this.checked)"><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+            <span class="toggle-label">Bazaar Flipper</span>
+            <label class="toggle"><input type="checkbox" id="tog-bazaar" onchange="toggleBazaarFlips(this.checked)"><span class="slider"></span></label>
+        </div>
     </div>
 </div>
 
@@ -392,7 +398,7 @@ a{color:var(--accent2);text-decoration:none}
             <canvas id="chart-bz" height="400"></canvas>
         </div>
         <div class="profit-stats">
-            <div class="profit-stat-box"><div class="label">Profit</div><div class="value" id="bz-profit-total">0</div><div class="profit-note warn" id="bz-cost-basis-note" style="display:none">UNKNOWN_COST_BASIS sells are ignored until matching FIFO BUY lots exist.</div></div>
+            <div class="profit-stat-box"><div class="label">Profit</div><div class="value" id="bz-profit-total">0</div></div>
             <div class="profit-stat-box"><div class="label">Uptime</div><div class="value" id="bz-uptime">—</div></div>
             <div class="profit-stat-box"><div class="label">P/H</div><div class="value" id="bz-per-hour">0</div></div>
         </div>
@@ -437,6 +443,8 @@ a{color:var(--accent2);text-decoration:none}
         <div class="cfg-row"><label class="cfg-label" for="cfg-multi_switch_time">Account Switch Time (hours)</label><input class="cfg-input" id="cfg-multi_switch_time" type="number" step="0.5" min="0" placeholder="0 = disabled"></div>
         <div class="cfg-row"><label class="cfg-label" for="cfg-web_gui_port">Web GUI Port</label><input class="cfg-input" id="cfg-web_gui_port" type="number" min="1" max="65535"></div>
         <div class="cfg-row"><label class="cfg-label" for="cfg-web_gui_password">Web GUI Password</label><input class="cfg-input" id="cfg-web_gui_password" type="text" placeholder="Leave empty to disable"></div>
+        <div class="cfg-row"><label class="cfg-label">Auction House Flipper</label><label class="toggle"><input type="checkbox" id="cfg-enable_ah_flips"><span class="slider"></span></label></div>
+        <div class="cfg-row"><label class="cfg-label">Bazaar Flipper</label><label class="toggle"><input type="checkbox" id="cfg-enable_bazaar_flips"><span class="slider"></span></label></div>
         <div class="cfg-row"><label class="cfg-label">Enable Console Input</label><label class="toggle"><input type="checkbox" id="cfg-enable_console_input"><span class="slider"></span></label></div>
         <div class="cfg-row"><label class="cfg-label">Share Legendary Flips</label><label class="toggle"><input type="checkbox" id="cfg-share_legendary_flips"><span class="slider"></span></label></div>
     </div>
@@ -465,6 +473,38 @@ a{color:var(--accent2);text-decoration:none}
         <div class="cfg-row"><label class="cfg-label" for="cfg-bazaar_order_check_interval_seconds">Order Check Interval (seconds)</label><input class="cfg-input" id="cfg-bazaar_order_check_interval_seconds" type="number" min="10"></div>
         <div class="cfg-row"><label class="cfg-label" for="cfg-bazaar_order_cancel_minutes_per_million">Cancel Minutes Per Million</label><input class="cfg-input" id="cfg-bazaar_order_cancel_minutes_per_million" type="number" min="1"></div>
         <div class="cfg-row"><label class="cfg-label" for="cfg-bazaar_tax_rate">Tax Rate (%)</label><input class="cfg-input" id="cfg-bazaar_tax_rate" type="number" step="0.05" min="0" max="5"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-purse_reserve_percent">Purse Reserve (%)</label><input class="cfg-input" id="cfg-purse_reserve_percent" type="number" step="0.5" min="0" max="95"></div>
+        <div class="cfg-row"><label class="cfg-label">Local Bazaar Scanner</label><label class="toggle"><input type="checkbox" id="cfg-enable_local_bazaar_scanner"><span class="slider"></span></label></div>
+        <div class="cfg-row"><label class="cfg-label">Classic Potato Book Flips</label><label class="toggle"><input type="checkbox" id="cfg-enable_classic_potato_book_flips"><span class="slider"></span></label></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_scan_interval_seconds">Local Scan Interval (seconds)</label><input class="cfg-input" id="cfg-local_bazaar_scan_interval_seconds" type="number" min="30"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_max_concurrent_orders">Max Parallel Local BUY Orders</label><input class="cfg-input" id="cfg-local_bazaar_max_concurrent_orders" type="number" min="1" max="21"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-min_profit_bazaar">Min Profit Bazaar (coins/order)</label><input class="cfg-input" id="cfg-min_profit_bazaar" type="number" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_min_profit_per_unit">Min Profit Per Unit</label><input class="cfg-input" id="cfg-local_bazaar_min_profit_per_unit" type="number" step="0.1" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_min_margin_percent">Min Margin (%)</label><input class="cfg-input" id="cfg-local_bazaar_min_margin_percent" type="number" step="0.1" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_max_margin_percent">Max Margin (%)</label><input class="cfg-input" id="cfg-local_bazaar_max_margin_percent" type="number" step="0.1" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_target_profit_per_hour">Target Profit / Hour</label><input class="cfg-input" id="cfg-local_bazaar_target_profit_per_hour" type="number" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_total_capital">Bazaar Capital Model</label><input class="cfg-input" id="cfg-local_bazaar_total_capital" type="number" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_active_capital_ratio">Active Capital Ratio</label><input class="cfg-input" id="cfg-local_bazaar_active_capital_ratio" type="number" step="0.01" min="0.05" max="1"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_reserve_ratio">Reserve Ratio</label><input class="cfg-input" id="cfg-local_bazaar_reserve_ratio" type="number" step="0.01" min="0" max="0.95"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_max_items">Max Bazaar Items</label><input class="cfg-input" id="cfg-local_bazaar_max_items" type="number" min="1" max="16"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_max_capital_per_item">Max Capital / Item</label><input class="cfg-input" id="cfg-local_bazaar_max_capital_per_item" type="number" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_min_roi_percent">Min ROI After Tax (%)</label><input class="cfg-input" id="cfg-local_bazaar_min_roi_percent" type="number" step="0.1" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_target_roi_percent">Target ROI (%)</label><input class="cfg-input" id="cfg-local_bazaar_target_roi_percent" type="number" step="0.1" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_min_volume_value_hour">Min Volume Value / Hour</label><input class="cfg-input" id="cfg-local_bazaar_min_volume_value_hour" type="number" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_preferred_volume_value_hour">Preferred Volume Value / Hour</label><input class="cfg-input" id="cfg-local_bazaar_preferred_volume_value_hour" type="number" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_market_participation_rate">Market Share</label><input class="cfg-input" id="cfg-local_bazaar_market_participation_rate" type="number" step="0.01" min="0.01" max="0.30"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_conservative_market_participation_rate">Conservative Market Share</label><input class="cfg-input" id="cfg-local_bazaar_conservative_market_participation_rate" type="number" step="0.01" min="0.01" max="0.20"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_history_window_minutes">History Window (minutes)</label><input class="cfg-input" id="cfg-local_bazaar_history_window_minutes" type="number" min="5"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_min_free_inventory_slots">Min Free Inventory Slots</label><input class="cfg-input" id="cfg-local_bazaar_min_free_inventory_slots" type="number" min="1" max="30"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_max_pending_buy_stacks">Max Pending BUY Stacks</label><input class="cfg-input" id="cfg-local_bazaar_max_pending_buy_stacks" type="number" min="1" max="21"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_buy_sell_balance_limit">BUY / SELL Balance Limit</label><input class="cfg-input" id="cfg-local_bazaar_buy_sell_balance_limit" type="number" step="0.05" min="1" max="3"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_min_buy_volume">Min Buy Volume</label><input class="cfg-input" id="cfg-local_bazaar_min_buy_volume" type="number" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_min_sell_volume">Min Sell Volume</label><input class="cfg-input" id="cfg-local_bazaar_min_sell_volume" type="number" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_min_order_count">Min Orders / Side</label><input class="cfg-input" id="cfg-local_bazaar_min_order_count" type="number" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_min_moving_week">Min Moving Week</label><input class="cfg-input" id="cfg-local_bazaar_min_moving_week" type="number" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_max_order_value">Max Coins Per Local Order</label><input class="cfg-input" id="cfg-local_bazaar_max_order_value" type="number" min="0"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_max_amount">Max Amount Per Local Order</label><input class="cfg-input" id="cfg-local_bazaar_max_amount" type="number" min="1"></div>
+        <div class="cfg-row"><label class="cfg-label" for="cfg-local_bazaar_price_undercut">Price Step</label><input class="cfg-input" id="cfg-local_bazaar_price_undercut" type="number" step="0.1" min="0"></div>
     </div>
 
     <!-- Category: Humanization -->
@@ -668,6 +708,8 @@ async function fetchStatus() {
         $('s-purse').textContent = formatCoins(d.purse);
         $('s-uptime').textContent = formatUptime(d.uptime_seconds);
         $('tog-anon').checked = d.anonymize_webhook_name;
+        $('tog-ah').checked = d.enable_ah_flips;
+        $('tog-bazaar').checked = d.enable_bazaar_flips;
         isAnonymized = d.anonymize_webhook_name;
         $('btn-pause').style.display = d.macro_paused ? 'none' : '';
         $('btn-resume').style.display = d.macro_paused ? '' : 'none';
@@ -718,6 +760,16 @@ async function resumeMacro() { await fetch('/api/resume', {method:'POST'}); fetc
 
 async function toggleAnonymize(enabled) {
     await fetch('/api/toggle_anonymize', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})});
+}
+
+async function toggleAhFlips(enabled) {
+    await fetch('/api/toggle_ah', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})});
+    fetchStatus();
+}
+
+async function toggleBazaarFlips(enabled) {
+    await fetch('/api/toggle_bazaar', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})});
+    fetchStatus();
 }
 
 async function switchAccount(index) {
@@ -1461,8 +1513,6 @@ async function fetchProfit() {
         $('ah-per-hour').textContent = hours > 0 ? formatProfitLabel(d.ah_total / hours) : '0';
 
         $('bz-profit-total').textContent = formatProfitLabel(d.bz_total);
-        const bzNote = $('bz-cost-basis-note');
-        if (bzNote) bzNote.style.display = d.bz_unknown_cost_basis ? 'block' : 'none';
         $('bz-uptime').textContent = upStr;
         $('bz-per-hour').textContent = hours > 0 ? formatProfitLabel(d.bz_total / hours) : '0';
 
@@ -1510,6 +1560,37 @@ const CONFIG_FIELDS = {
     bazaar_order_check_interval_seconds: {type:'int', default:60},
     bazaar_order_cancel_minutes_per_million: {type:'int', default:1},
     bazaar_tax_rate: {type:'float', default:1.25},
+    purse_reserve_percent: {type:'float', default:22.0},
+    local_bazaar_scan_interval_seconds: {type:'int', default:60},
+    local_bazaar_max_concurrent_orders: {type:'int', default:6},
+    min_profit_bazaar: {type:'float', default:25000.0},
+    local_bazaar_min_profit_per_unit: {type:'float', default:5.0},
+    local_bazaar_min_total_profit: {type:'float', default:15000.0},
+    local_bazaar_min_margin_percent: {type:'float', default:1.25},
+    local_bazaar_max_margin_percent: {type:'float', default:32.0},
+    local_bazaar_target_profit_per_hour: {type:'float', default:2000000.0},
+    local_bazaar_total_capital: {type:'int', default:30000000},
+    local_bazaar_active_capital_ratio: {type:'float', default:0.78},
+    local_bazaar_reserve_ratio: {type:'float', default:0.22},
+    local_bazaar_max_items: {type:'int', default:8},
+    local_bazaar_max_capital_per_item: {type:'int', default:5000000},
+    local_bazaar_min_roi_percent: {type:'float', default:1.0},
+    local_bazaar_target_roi_percent: {type:'float', default:2.0},
+    local_bazaar_min_volume_value_hour: {type:'float', default:5000000.0},
+    local_bazaar_preferred_volume_value_hour: {type:'float', default:20000000.0},
+    local_bazaar_market_participation_rate: {type:'float', default:0.12},
+    local_bazaar_conservative_market_participation_rate: {type:'float', default:0.06},
+    local_bazaar_history_window_minutes: {type:'int', default:60},
+    local_bazaar_min_free_inventory_slots: {type:'int', default:10},
+    local_bazaar_max_pending_buy_stacks: {type:'int', default:6},
+    local_bazaar_buy_sell_balance_limit: {type:'float', default:1.10},
+    local_bazaar_min_buy_volume: {type:'int', default:5000},
+    local_bazaar_min_sell_volume: {type:'int', default:5000},
+    local_bazaar_min_order_count: {type:'int', default:20},
+    local_bazaar_min_moving_week: {type:'int', default:250000},
+    local_bazaar_max_order_value: {type:'int', default:5000000},
+    local_bazaar_max_amount: {type:'int', default:71680},
+    local_bazaar_price_undercut: {type:'float', default:0.1},
     auction_listing_delay_ms: {type:'int', default:1500},
     auction_duration_hours: {type:'int', default:24},
     max_items_in_inventory: {type:'int', default:12},
@@ -1520,11 +1601,15 @@ const CONFIG_FIELDS = {
     humanization_max_break_minutes: {type:'int', default:10},
     // booleans
     bed_spam: {type:'bool', default:false},
+    enable_ah_flips: {type:'bool', default:true},
+    enable_bazaar_flips: {type:'bool', default:true},
     use_cofl_chat: {type:'bool', default:true},
     enable_console_input: {type:'bool', default:true},
     proxy_enabled: {type:'bool', default:false},
     share_legendary_flips: {type:'bool', default:true},
     humanization_enabled: {type:'bool', default:false},
+    enable_local_bazaar_scanner: {type:'bool', default:true},
+    enable_classic_potato_book_flips: {type:'bool', default:true},
 };
 
 // Simple TOML parser for flat config (no nested tables except [sessions])

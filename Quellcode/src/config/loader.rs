@@ -31,52 +31,53 @@ impl ConfigLoader {
                 PathBuf::from(".")
             }
         };
-        
+
         exe_dir.join("config.toml")
     }
 
     pub fn load(&self) -> Result<Config> {
         if !self.config_path.exists() {
-            info!("Config file not found, creating default config at {:?}", self.config_path);
+            info!(
+                "Config file not found, creating default config at {:?}",
+                self.config_path
+            );
             let config = Config::default();
             self.save(&config)?;
             return Ok(config);
         }
 
-        let contents = fs::read_to_string(&self.config_path)
-            .context("Failed to read config file")?;
-        
+        let contents =
+            fs::read_to_string(&self.config_path).context("Failed to read config file")?;
+
         let config = Self::parse_config(&contents)?;
-        
+
         // Re-save after every load so that newly added config fields
         // appear in the file with their default values (matches TypeScript
         // initConfigHelper: "add new default values to existing config").
         self.save(&config)?;
-        
+
         info!("Loaded configuration from {:?}", self.config_path);
         Ok(config)
     }
 
     fn parse_config(contents: &str) -> Result<Config> {
-        let value: toml::Value = toml::from_str(contents)
-            .context("Failed to parse config file")?;
+        let value: toml::Value = toml::from_str(contents).context("Failed to parse config file")?;
 
-        value.try_into().context("Failed to deserialize config file")
+        value
+            .try_into()
+            .context("Failed to deserialize config file")
     }
 
     pub fn save(&self, config: &Config) -> Result<()> {
         // Ensure parent directory exists
         if let Some(parent) = self.config_path.parent() {
-            fs::create_dir_all(parent)
-                .context("Failed to create config directory")?;
+            fs::create_dir_all(parent).context("Failed to create config directory")?;
         }
 
-        let toml_string = toml::to_string_pretty(config)
-            .context("Failed to serialize config")?;
-        
-        fs::write(&self.config_path, toml_string)
-            .context("Failed to write config file")?;
-        
+        let toml_string = toml::to_string_pretty(config).context("Failed to serialize config")?;
+
+        fs::write(&self.config_path, toml_string).context("Failed to write config file")?;
+
         info!("Saved configuration to {:?}", self.config_path);
         Ok(())
     }

@@ -1,6 +1,6 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use chrono::{DateTime, Utc};
 
 /// Serde helpers that serialize `None` as `""` and deserialize `""` as `None`.
 /// This ensures optional string config fields always appear in the saved TOML file
@@ -59,10 +59,10 @@ pub struct Config {
     /// means switch accounts every 12 hours. Set to `0` to disable automatic switching.
     #[serde(default, with = "opt_f64_as_zero")]
     pub multi_switch_time: Option<f64>,
-    
+
     #[serde(default = "default_websocket_url")]
     pub websocket_url: String,
-    
+
     #[serde(default = "default_web_gui_port")]
     pub web_gui_port: u16,
 
@@ -71,23 +71,26 @@ pub struct Config {
     /// Default: 500ms.
     #[serde(default = "default_command_delay_ms")]
     pub command_delay_ms: u64,
-    
+
     #[serde(default = "default_bed_spam_click_delay")]
     pub bed_spam_click_delay: u64,
-    
+
     #[serde(default)]
     pub bed_multiple_clicks_delay: u64,
-    
+
     /// How many ms before the COFL `purchaseAt` deadline to start clicking (default: 30).
     /// Only used when `freemoney = true`. Without freemoney, bed spam starts immediately
     /// using `bed_spam_click_delay` and this value is ignored.
     #[serde(default = "default_bed_pre_click_ms")]
     pub bed_pre_click_ms: u64,
-    
+
     #[serde(default = "default_bazaar_order_check_interval_seconds")]
     pub bazaar_order_check_interval_seconds: u64,
-    
-    #[serde(default = "default_bazaar_order_cancel_minutes_per_million", alias = "bazaar_order_cancel_minutes")]
+
+    #[serde(
+        default = "default_bazaar_order_cancel_minutes_per_million",
+        alias = "bazaar_order_cancel_minutes"
+    )]
     pub bazaar_order_cancel_minutes_per_million: u64,
 
     /// Bazaar sell tax rate as a percentage (e.g. 1.25 = 1.25%).
@@ -97,27 +100,134 @@ pub struct Config {
     #[serde(default = "default_bazaar_tax_rate")]
     pub bazaar_tax_rate: f64,
 
-    /// Reset persisted FIFO Bazaar buy-cost lots on startup, but only when
-    /// there are no tracked Bazaar orders and the cached player inventory is empty.
-    #[serde(default)]
-    pub reset_bazaar_buy_costs_on_startup: bool,
+    /// Percent of current purse that must stay untouched by local Bazaar BUY orders.
+    #[serde(default = "default_purse_reserve_percent")]
+    pub purse_reserve_percent: f64,
+
+    /// Enable local Bazaar scanning using the public Hypixel Bazaar API.
+    /// When enabled, the bot periodically ranks products by spread, volume,
+    /// and profit, then queues the best BUY order. COFL Bazaar flips remain
+    /// enabled separately.
+    #[serde(default = "default_true")]
+    pub enable_local_bazaar_scanner: bool,
+
+    /// Seconds between local Bazaar scans.
+    #[serde(default = "default_local_bazaar_scan_interval_seconds")]
+    pub local_bazaar_scan_interval_seconds: u64,
+
+    /// Minimum expected profit per item after Bazaar tax.
+    #[serde(
+        default = "default_local_bazaar_min_profit_per_unit",
+        alias = "minProfitBazaar"
+    )]
+    pub local_bazaar_min_profit_per_unit: f64,
+
+    /// Backward-compatible alias-style field name users asked for.
+    #[serde(
+        default = "default_local_bazaar_min_total_profit",
+        alias = "local_bazaar_min_profit"
+    )]
+    pub min_profit_bazaar: f64,
+
+    /// Minimum expected total profit for the full order after Bazaar tax.
+    #[serde(default = "default_local_bazaar_min_total_profit")]
+    pub local_bazaar_min_total_profit: f64,
+
+    /// Minimum profit margin percentage after Bazaar tax.
+    #[serde(default = "default_local_bazaar_min_margin_percent")]
+    pub local_bazaar_min_margin_percent: f64,
+
+    /// Maximum profit margin percentage. Very high margins are usually stale,
+    /// manipulated, or too illiquid to fill reliably.
+    #[serde(default = "default_local_bazaar_max_margin_percent")]
+    pub local_bazaar_max_margin_percent: f64,
+
+    /// Minimum active buy/sell order volume required by Hypixel quick_status.
+    #[serde(default = "default_local_bazaar_min_volume")]
+    pub local_bazaar_min_buy_volume: u64,
+    #[serde(default = "default_local_bazaar_min_volume")]
+    pub local_bazaar_min_sell_volume: u64,
+
+    /// Minimum active order count on both Bazaar sides.
+    #[serde(default = "default_local_bazaar_min_order_count")]
+    pub local_bazaar_min_order_count: u64,
+
+    /// Minimum 7-day moved volume required.
+    #[serde(default = "default_local_bazaar_min_moving_week")]
+    pub local_bazaar_min_moving_week: u64,
+
+    /// Maximum coins to put into one local Bazaar BUY order.
+    /// 0 means use volume/max amount only.
+    #[serde(default = "default_local_bazaar_max_order_value")]
+    pub local_bazaar_max_order_value: u64,
+
+    /// Maximum item amount for one local Bazaar BUY order.
+    #[serde(default = "default_local_bazaar_max_amount")]
+    pub local_bazaar_max_amount: u64,
+
+    /// Price step used to beat the current top order/offer.
+    #[serde(default = "default_local_bazaar_price_undercut")]
+    pub local_bazaar_price_undercut: f64,
+
+    /// Maximum number of active local-scanner Bazaar BUY orders to keep open.
+    #[serde(default = "default_local_bazaar_max_concurrent_orders")]
+    pub local_bazaar_max_concurrent_orders: usize,
+
+    /// Desired local Bazaar profit per hour. Used to reject flips that are too
+    /// slow relative to configured volume and target profit.
+    #[serde(default = "default_local_bazaar_target_profit_per_hour")]
+    pub local_bazaar_target_profit_per_hour: f64,
+
+    /// Capital model used by the local Bazaar allocation algorithm.
+    #[serde(default = "default_local_bazaar_total_capital")]
+    pub local_bazaar_total_capital: u64,
+    #[serde(default = "default_local_bazaar_active_capital_ratio")]
+    pub local_bazaar_active_capital_ratio: f64,
+    #[serde(default = "default_local_bazaar_reserve_ratio")]
+    pub local_bazaar_reserve_ratio: f64,
+    #[serde(default = "default_local_bazaar_max_items")]
+    pub local_bazaar_max_items: usize,
+    #[serde(default = "default_local_bazaar_max_capital_per_item")]
+    pub local_bazaar_max_capital_per_item: u64,
+    #[serde(default = "default_local_bazaar_min_roi_percent")]
+    pub local_bazaar_min_roi_percent: f64,
+    #[serde(default = "default_local_bazaar_target_roi_percent")]
+    pub local_bazaar_target_roi_percent: f64,
+    #[serde(default = "default_local_bazaar_min_volume_value_hour")]
+    pub local_bazaar_min_volume_value_hour: f64,
+    #[serde(default = "default_local_bazaar_preferred_volume_value_hour")]
+    pub local_bazaar_preferred_volume_value_hour: f64,
+    #[serde(default = "default_local_bazaar_market_participation_rate")]
+    pub local_bazaar_market_participation_rate: f64,
+    #[serde(default = "default_local_bazaar_conservative_market_participation_rate")]
+    pub local_bazaar_conservative_market_participation_rate: f64,
+    #[serde(default = "default_local_bazaar_history_window_minutes")]
+    pub local_bazaar_history_window_minutes: u64,
+    #[serde(default = "default_local_bazaar_min_free_inventory_slots")]
+    pub local_bazaar_min_free_inventory_slots: u64,
+    #[serde(default = "default_local_bazaar_max_pending_buy_stacks")]
+    pub local_bazaar_max_pending_buy_stacks: u64,
+    #[serde(default = "default_local_bazaar_buy_sell_balance_limit")]
+    pub local_bazaar_buy_sell_balance_limit: f64,
+
+    /// Prefer/allow classic high-liquidity potato book flips.
+    #[serde(default = "default_true", alias = "classic_potato_book_flips")]
+    pub enable_classic_potato_book_flips: bool,
 
     /// Delay in milliseconds between consecutive auction listing commands
     /// (SellToAuction). Prevents Hypixel from kicking the bot with
     /// "Sending packets too fast!" during bulk listings. Default: 1500ms.
     #[serde(default = "default_auction_listing_delay_ms")]
     pub auction_listing_delay_ms: u64,
-    
-    /// **Deprecated**: COFL now handles flip type selection automatically.
-    /// This field is kept for backward compatibility but is always treated as true.
-    #[serde(default = "default_true", skip_serializing)]
+
+    /// Enable Bazaar flipping intake and local Bazaar scanner.
+    #[serde(default = "default_true")]
     pub enable_bazaar_flips: bool,
-    
-    /// **Deprecated**: COFL now handles flip type selection automatically.
-    /// This field is kept for backward compatibility but is always treated as true.
-    #[serde(default = "default_true", skip_serializing)]
+
+    /// Enable Auction House flipping intake.
+    #[serde(default = "default_true")]
     pub enable_ah_flips: bool,
-    
+
     #[serde(default)]
     pub bed_spam: bool,
 
@@ -129,17 +239,16 @@ pub struct Config {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freemoney: Option<bool>,
-    
+
     #[serde(default = "default_true")]
     pub use_cofl_chat: bool,
-    
+
     #[serde(default)]
     pub auto_cookie: u64,
 
-    
     #[serde(default = "default_true")]
     pub enable_console_input: bool,
-    
+
     #[serde(default = "default_auction_duration_hours")]
     pub auction_duration_hours: u64,
 
@@ -148,21 +257,21 @@ pub struct Config {
     /// Default: 12.
     #[serde(default = "default_max_items_in_inventory")]
     pub max_items_in_inventory: u64,
-    
+
     /// Enable proxy for both the Minecraft and WebSocket connections.
     #[serde(default)]
     pub proxy_enabled: bool,
-    
+
     /// Proxy server address in `host:port` format, e.g. `"121.124.241.211:3313"`.
     /// Only used when `proxy_enabled = true`. Leave empty to disable.
     #[serde(default, with = "opt_string_as_empty")]
     pub proxy_address: Option<String>,
-    
+
     /// Proxy credentials in `username:password` format, e.g. `"myuser:mypassword"`.
     /// Leave empty if the proxy requires no authentication.
     #[serde(default, with = "opt_string_as_empty")]
     pub proxy_credentials: Option<String>,
-    
+
     #[serde(default)]
     /// Discord webhook URL for notifications.
     /// `None` = not yet configured (prompts on next startup).
@@ -180,7 +289,7 @@ pub struct Config {
     /// Leave empty to disable pings.
     #[serde(default, with = "opt_string_as_empty")]
     pub discord_id: Option<String>,
-    
+
     /// Password to protect the web control panel. Leave empty to disable authentication.
     #[serde(default, with = "opt_string_as_empty")]
     pub web_gui_password: Option<String>,
@@ -202,7 +311,7 @@ pub struct Config {
     /// toggle in the web panel that always defaults to OFF on page load.
     #[serde(default)]
     pub anonymize_webhook_name: bool,
-    
+
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub sessions: HashMap<String, CoflSession>,
 
@@ -269,6 +378,122 @@ fn default_bazaar_tax_rate() -> f64 {
     1.25
 }
 
+fn default_purse_reserve_percent() -> f64 {
+    22.0
+}
+
+fn default_local_bazaar_scan_interval_seconds() -> u64 {
+    60
+}
+
+fn default_local_bazaar_min_profit_per_unit() -> f64 {
+    5.0
+}
+
+fn default_local_bazaar_min_total_profit() -> f64 {
+    15_000.0
+}
+
+fn default_local_bazaar_min_margin_percent() -> f64 {
+    1.25
+}
+
+fn default_local_bazaar_max_margin_percent() -> f64 {
+    32.0
+}
+
+fn default_local_bazaar_min_volume() -> u64 {
+    5_000
+}
+
+fn default_local_bazaar_min_order_count() -> u64 {
+    20
+}
+
+fn default_local_bazaar_min_moving_week() -> u64 {
+    250_000
+}
+
+fn default_local_bazaar_max_order_value() -> u64 {
+    5_000_000
+}
+
+fn default_local_bazaar_max_amount() -> u64 {
+    71_680
+}
+
+fn default_local_bazaar_price_undercut() -> f64 {
+    0.1
+}
+
+fn default_local_bazaar_max_concurrent_orders() -> usize {
+    6
+}
+
+fn default_local_bazaar_target_profit_per_hour() -> f64 {
+    2_000_000.0
+}
+
+fn default_local_bazaar_total_capital() -> u64 {
+    30_000_000
+}
+
+fn default_local_bazaar_active_capital_ratio() -> f64 {
+    0.78
+}
+
+fn default_local_bazaar_reserve_ratio() -> f64 {
+    0.22
+}
+
+fn default_local_bazaar_max_items() -> usize {
+    8
+}
+
+fn default_local_bazaar_max_capital_per_item() -> u64 {
+    5_000_000
+}
+
+fn default_local_bazaar_min_roi_percent() -> f64 {
+    1.0
+}
+
+fn default_local_bazaar_target_roi_percent() -> f64 {
+    2.0
+}
+
+fn default_local_bazaar_min_volume_value_hour() -> f64 {
+    5_000_000.0
+}
+
+fn default_local_bazaar_preferred_volume_value_hour() -> f64 {
+    20_000_000.0
+}
+
+fn default_local_bazaar_market_participation_rate() -> f64 {
+    0.12
+}
+
+fn default_local_bazaar_conservative_market_participation_rate() -> f64 {
+    0.06
+}
+
+fn default_local_bazaar_history_window_minutes() -> u64 {
+    60
+}
+
+fn default_local_bazaar_min_free_inventory_slots() -> u64 {
+    10
+}
+
+fn default_local_bazaar_max_pending_buy_stacks() -> u64 {
+    6
+}
+
+fn default_local_bazaar_buy_sell_balance_limit() -> f64 {
+    1.10
+}
+
 fn default_auction_listing_delay_ms() -> u64 {
     1500
 }
@@ -313,9 +538,45 @@ impl Default for Config {
             bed_multiple_clicks_delay: 0,
             bed_pre_click_ms: default_bed_pre_click_ms(),
             bazaar_order_check_interval_seconds: default_bazaar_order_check_interval_seconds(),
-            bazaar_order_cancel_minutes_per_million: default_bazaar_order_cancel_minutes_per_million(),
+            bazaar_order_cancel_minutes_per_million:
+                default_bazaar_order_cancel_minutes_per_million(),
             bazaar_tax_rate: default_bazaar_tax_rate(),
-            reset_bazaar_buy_costs_on_startup: false,
+            purse_reserve_percent: default_purse_reserve_percent(),
+            enable_local_bazaar_scanner: true,
+            local_bazaar_scan_interval_seconds: default_local_bazaar_scan_interval_seconds(),
+            local_bazaar_min_profit_per_unit: default_local_bazaar_min_profit_per_unit(),
+            min_profit_bazaar: default_local_bazaar_min_total_profit(),
+            local_bazaar_min_total_profit: default_local_bazaar_min_total_profit(),
+            local_bazaar_min_margin_percent: default_local_bazaar_min_margin_percent(),
+            local_bazaar_max_margin_percent: default_local_bazaar_max_margin_percent(),
+            local_bazaar_min_buy_volume: default_local_bazaar_min_volume(),
+            local_bazaar_min_sell_volume: default_local_bazaar_min_volume(),
+            local_bazaar_min_order_count: default_local_bazaar_min_order_count(),
+            local_bazaar_min_moving_week: default_local_bazaar_min_moving_week(),
+            local_bazaar_max_order_value: default_local_bazaar_max_order_value(),
+            local_bazaar_max_amount: default_local_bazaar_max_amount(),
+            local_bazaar_price_undercut: default_local_bazaar_price_undercut(),
+            local_bazaar_max_concurrent_orders: default_local_bazaar_max_concurrent_orders(),
+            local_bazaar_target_profit_per_hour: default_local_bazaar_target_profit_per_hour(),
+            local_bazaar_total_capital: default_local_bazaar_total_capital(),
+            local_bazaar_active_capital_ratio: default_local_bazaar_active_capital_ratio(),
+            local_bazaar_reserve_ratio: default_local_bazaar_reserve_ratio(),
+            local_bazaar_max_items: default_local_bazaar_max_items(),
+            local_bazaar_max_capital_per_item: default_local_bazaar_max_capital_per_item(),
+            local_bazaar_min_roi_percent: default_local_bazaar_min_roi_percent(),
+            local_bazaar_target_roi_percent: default_local_bazaar_target_roi_percent(),
+            local_bazaar_min_volume_value_hour: default_local_bazaar_min_volume_value_hour(),
+            local_bazaar_preferred_volume_value_hour:
+                default_local_bazaar_preferred_volume_value_hour(),
+            local_bazaar_market_participation_rate: default_local_bazaar_market_participation_rate(
+            ),
+            local_bazaar_conservative_market_participation_rate:
+                default_local_bazaar_conservative_market_participation_rate(),
+            local_bazaar_history_window_minutes: default_local_bazaar_history_window_minutes(),
+            local_bazaar_min_free_inventory_slots: default_local_bazaar_min_free_inventory_slots(),
+            local_bazaar_max_pending_buy_stacks: default_local_bazaar_max_pending_buy_stacks(),
+            local_bazaar_buy_sell_balance_limit: default_local_bazaar_buy_sell_balance_limit(),
+            enable_classic_potato_book_flips: true,
             auction_listing_delay_ms: default_auction_listing_delay_ms(),
             enable_bazaar_flips: true,
             enable_ah_flips: true,
@@ -409,7 +670,8 @@ mod tests {
 
     #[test]
     fn default_config_omits_freemoney() {
-        let toml = toml::to_string_pretty(&Config::default()).expect("default config should serialize");
+        let toml =
+            toml::to_string_pretty(&Config::default()).expect("default config should serialize");
         assert!(!toml.contains("freemoney"));
     }
 
@@ -421,7 +683,8 @@ mod tests {
 
     #[test]
     fn parses_bed_spam_click_delay() {
-        let config: Config = toml::from_str("bed_spam_click_delay = 125").expect("config should parse");
+        let config: Config =
+            toml::from_str("bed_spam_click_delay = 125").expect("config should parse");
         assert_eq!(config.bed_spam_click_delay, 125);
     }
 
@@ -439,7 +702,8 @@ mod tests {
 
     #[test]
     fn single_ingame_name() {
-        let config: Config = toml::from_str(r#"ingame_name = "Player1""#).expect("config should parse");
+        let config: Config =
+            toml::from_str(r#"ingame_name = "Player1""#).expect("config should parse");
         assert_eq!(config.ingame_names(), vec!["Player1"]);
     }
 
@@ -465,26 +729,29 @@ mod tests {
 
     #[test]
     fn parses_multi_switch_time() {
-        let config: Config = toml::from_str("multi_switch_time = 12.0").expect("config should parse");
+        let config: Config =
+            toml::from_str("multi_switch_time = 12.0").expect("config should parse");
         assert_eq!(config.multi_switch_time, Some(12.0));
     }
 
     #[test]
     fn multi_switch_time_zero_is_none() {
-        let config: Config = toml::from_str("multi_switch_time = 0.0").expect("config should parse");
+        let config: Config =
+            toml::from_str("multi_switch_time = 0.0").expect("config should parse");
         assert_eq!(config.multi_switch_time, None);
     }
 
     #[test]
     fn multi_switch_time_default_serializes_as_zero() {
-        let toml = toml::to_string_pretty(&Config::default()).expect("default config should serialize");
+        let toml =
+            toml::to_string_pretty(&Config::default()).expect("default config should serialize");
         assert!(toml.contains("multi_switch_time = 0.0"));
     }
 
     #[test]
     fn proxy_credentials_parsing() {
-        let config: Config =
-            toml::from_str(r#"proxy_credentials = "myuser:mypassword""#).expect("config should parse");
+        let config: Config = toml::from_str(r#"proxy_credentials = "myuser:mypassword""#)
+            .expect("config should parse");
         assert_eq!(config.proxy_username(), Some("myuser"));
         assert_eq!(config.proxy_password(), Some("mypassword"));
     }
@@ -505,19 +772,35 @@ mod tests {
 
     #[test]
     fn web_gui_password_empty_string_is_none() {
-        let config: Config = toml::from_str(r#"web_gui_password = """#).expect("config should parse");
+        let config: Config =
+            toml::from_str(r#"web_gui_password = """#).expect("config should parse");
         assert_eq!(config.web_gui_password, None);
     }
 
     #[test]
     fn optional_fields_appear_in_default_config() {
-        let toml = toml::to_string_pretty(&Config::default()).expect("default config should serialize");
-        assert!(toml.contains("web_gui_password"), "web_gui_password should appear in default config");
-        assert!(toml.contains("proxy_address"), "proxy_address should appear in default config");
-        assert!(toml.contains("proxy_credentials"), "proxy_credentials should appear in default config");
-        assert!(toml.contains("multi_switch_time"), "multi_switch_time should appear in default config");
-        assert!(toml.contains("discord_id"), "discord_id should appear in default config");
-        assert!(toml.contains("reset_bazaar_buy_costs_on_startup"), "reset_bazaar_buy_costs_on_startup should appear in default config");
+        let toml =
+            toml::to_string_pretty(&Config::default()).expect("default config should serialize");
+        assert!(
+            toml.contains("web_gui_password"),
+            "web_gui_password should appear in default config"
+        );
+        assert!(
+            toml.contains("proxy_address"),
+            "proxy_address should appear in default config"
+        );
+        assert!(
+            toml.contains("proxy_credentials"),
+            "proxy_credentials should appear in default config"
+        );
+        assert!(
+            toml.contains("multi_switch_time"),
+            "multi_switch_time should appear in default config"
+        );
+        assert!(
+            toml.contains("discord_id"),
+            "discord_id should appear in default config"
+        );
     }
 
     #[test]
@@ -531,14 +814,18 @@ proxy_credentials = "myuser:mypassword"
         )
         .expect("config should parse");
         assert!(config.proxy_enabled);
-        assert_eq!(config.proxy_address.as_deref(), Some("121.124.241.211:3313"));
+        assert_eq!(
+            config.proxy_address.as_deref(),
+            Some("121.124.241.211:3313")
+        );
         assert_eq!(config.proxy_username(), Some("myuser"));
         assert_eq!(config.proxy_password(), Some("mypassword"));
     }
 
     #[test]
     fn default_config_has_no_skip_field() {
-        let toml = toml::to_string_pretty(&Config::default()).expect("default config should serialize");
+        let toml =
+            toml::to_string_pretty(&Config::default()).expect("default config should serialize");
         assert!(!toml.contains("[skip]"));
         assert!(!toml.contains("min_profit"));
     }
@@ -552,7 +839,8 @@ proxy_credentials = "myuser:mypassword"
 
     #[test]
     fn discord_id_parses_and_returns_active() {
-        let config: Config = toml::from_str(r#"discord_id = "123456789012345678""#).expect("config should parse");
+        let config: Config =
+            toml::from_str(r#"discord_id = "123456789012345678""#).expect("config should parse");
         assert_eq!(config.active_discord_id(), Some("123456789012345678"));
     }
 
@@ -582,8 +870,12 @@ proxy_credentials = "myuser:mypassword"
 
     #[test]
     fn skip_appears_in_default_config() {
-        let toml = toml::to_string_pretty(&Config::default()).expect("default config should serialize");
-        assert!(toml.contains("skip = false"), "skip should appear in default config");
+        let toml =
+            toml::to_string_pretty(&Config::default()).expect("default config should serialize");
+        assert!(
+            toml.contains("skip = false"),
+            "skip should appear in default config"
+        );
     }
 
     #[test]
@@ -595,29 +887,43 @@ proxy_credentials = "myuser:mypassword"
 
     #[test]
     fn bazaar_webhook_url_falls_back_to_regular() {
-        let config: Config = toml::from_str(r#"webhook_url = "https://discord.com/api/webhooks/main""#)
-            .expect("config should parse");
-        assert_eq!(config.active_bazaar_webhook_url(), Some("https://discord.com/api/webhooks/main"));
+        let config: Config =
+            toml::from_str(r#"webhook_url = "https://discord.com/api/webhooks/main""#)
+                .expect("config should parse");
+        assert_eq!(
+            config.active_bazaar_webhook_url(),
+            Some("https://discord.com/api/webhooks/main")
+        );
     }
 
     #[test]
     fn bazaar_webhook_url_overrides_regular() {
         let config: Config = toml::from_str(
             r#"webhook_url = "https://discord.com/api/webhooks/main"
-bazaar_webhook_url = "https://discord.com/api/webhooks/bazaar""#
-        ).expect("config should parse");
-        assert_eq!(config.active_bazaar_webhook_url(), Some("https://discord.com/api/webhooks/bazaar"));
+bazaar_webhook_url = "https://discord.com/api/webhooks/bazaar""#,
+        )
+        .expect("config should parse");
+        assert_eq!(
+            config.active_bazaar_webhook_url(),
+            Some("https://discord.com/api/webhooks/bazaar")
+        );
         // Regular webhook is unchanged
-        assert_eq!(config.active_webhook_url(), Some("https://discord.com/api/webhooks/main"));
+        assert_eq!(
+            config.active_webhook_url(),
+            Some("https://discord.com/api/webhooks/main")
+        );
     }
 
     #[test]
     fn bazaar_webhook_url_empty_string_falls_back() {
         let config: Config = toml::from_str(
             r#"webhook_url = "https://discord.com/api/webhooks/main"
-bazaar_webhook_url = """#
-        ).expect("config should parse");
-        assert_eq!(config.active_bazaar_webhook_url(), Some("https://discord.com/api/webhooks/main"));
+bazaar_webhook_url = """#,
+        )
+        .expect("config should parse");
+        assert_eq!(
+            config.active_bazaar_webhook_url(),
+            Some("https://discord.com/api/webhooks/main")
+        );
     }
-
 }
