@@ -8,15 +8,17 @@
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
 /// File name for persisted orders (stored next to the executable / in the logs dir).
 const ORDERS_FILE: &str = "bazaar_orders.json";
-/// File name for persisted buy costs.
-const BUY_COSTS_FILE: &str = "bazaar_buy_costs.json";
+/// Legacy weighted-average buy-cost file.  It is intentionally ignored for FIFO profit.
+const LEGACY_BUY_COSTS_FILE: &str = "bazaar_buy_costs.json";
+/// File name for persisted FIFO buy-cost lots.
+const BUY_COST_LOTS_FILE: &str = "bazaar_buy_cost_lots.json";
 
 /// A single tracked bazaar order visible on the web panel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,19 +33,78 @@ pub struct TrackedBazaarOrder {
     pub placed_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BuyCostLot {
+    pub price_per_unit: f64,
+    pub amount: u64,
+    pub collected_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BuyCostLotUsage {
+    pub price_per_unit: f64,
+    pub amount: u64,
+    pub total_cost: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CostBasisStatus {
+    Known,
+    UnknownCostBasis,
+}
+
+impl CostBasisStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Known => "KNOWN",
+            Self::UnknownCostBasis => "UNKNOWN_COST_BASIS",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SellProfitAudit {
+    pub item_name: String,
+    pub sold_amount: u64,
+    pub claimed_coins_after_tax: f64,
+    pub gross_list_value: Option<f64>,
+    pub lots_used: Vec<BuyCostLotUsage>,
+    pub cost_basis_total: f64,
+    pub cost_basis_status: CostBasisStatus,
+    pub realized_profit: i64,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BazaarProfitAuditSnapshot {
+    pub current_fifo_realized_profit_total: i64,
+    pub unknown_cost_basis_sell_total_count: u64,
+    pub ignored_legacy_profit_total: i64,
+    pub open_buy_capital: f64,
+    pub open_sell_value: f64,
+    pub remaining_cost_lots: HashMap<String, Vec<BuyCostLot>>,
+    pub web_graph_source: String,
+    pub last_sell_audit: Option<SellProfitAudit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct BazaarProfitAuditState {
+    current_fifo_realized_profit_total: i64,
+    unknown_cost_basis_sell_total_count: u64,
+    ignored_legacy_profit_total: i64,
+    last_sell_audit: Option<SellProfitAudit>,
+}
+
 /// Thread-safe tracker for active bazaar orders.
 #[derive(Clone)]
 pub struct BazaarOrderTracker {
     orders: Arc<RwLock<Vec<TrackedBazaarOrder>>>,
-    /// Stores (price_per_unit, amount) for all collected buy orders per item,
-    /// so that profit can be computed when the corresponding sell offer is
-    /// collected.  Multiple buy orders for the same item are accumulated
-    /// (weighted-average PPU) instead of overwriting.
-    last_buy_costs: Arc<RwLock<HashMap<String, (f64, u64)>>>,
-    /// Per-item profit data from `/cofl bz l` output.
-    /// Maps normalized item name → (total_profit, flip_count).
-    /// Used as a fallback when local buy-cost tracking has no data for a sell.
+    /// FIFO buy-cost lots collected locally in this session/process.
+    buy_cost_lots: Arc<RwLock<HashMap<String, VecDeque<BuyCostLot>>>>,
+    /// Per-item profit data from `/cofl bz l` output. Stored only for diagnostics;
+    /// it is never used as a graph/profit fallback.
     bz_list_profits: Arc<RwLock<HashMap<String, (i64, u32)>>>,
+    profit_audit: Arc<RwLock<BazaarProfitAuditState>>,
     /// SELL order targets created by the local Hypixel Bazaar scanner.
     /// Maps normalized item name → (target_sell_price_per_unit, item_tag, planned_amount).
     planned_local_sells: Arc<RwLock<HashMap<String, (f64, Option<String>, Option<u64>)>>>,
@@ -53,8 +114,9 @@ impl BazaarOrderTracker {
     pub fn new() -> Self {
         let tracker = Self {
             orders: Arc::new(RwLock::new(Vec::new())),
-            last_buy_costs: Arc::new(RwLock::new(HashMap::new())),
+            buy_cost_lots: Arc::new(RwLock::new(HashMap::new())),
             bz_list_profits: Arc::new(RwLock::new(HashMap::new())),
+            profit_audit: Arc::new(RwLock::new(BazaarProfitAuditState::default())),
             planned_local_sells: Arc::new(RwLock::new(HashMap::new())),
         };
         tracker.load_from_disk();
@@ -67,8 +129,9 @@ impl BazaarOrderTracker {
     pub fn new_in_memory() -> Self {
         Self {
             orders: Arc::new(RwLock::new(Vec::new())),
-            last_buy_costs: Arc::new(RwLock::new(HashMap::new())),
+            buy_cost_lots: Arc::new(RwLock::new(HashMap::new())),
             bz_list_profits: Arc::new(RwLock::new(HashMap::new())),
+            profit_audit: Arc::new(RwLock::new(BazaarProfitAuditState::default())),
             planned_local_sells: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -306,40 +369,181 @@ impl BazaarOrderTracker {
         removed
     }
 
-    /// Record a collected buy order's cost so that profit can be computed
-    /// when the corresponding sell offer for the same item is collected.
+    /// Record a collected buy order as an individual FIFO cost lot.
     ///
-    /// If a buy cost already exists for this item (e.g. two buy orders filled
-    /// before a single sell offer is collected), the amounts are accumulated
-    /// and the price-per-unit is recomputed as a weighted average so that the
-    /// profit calculation accounts for **all** purchased units, not just the
-    /// last batch.
+    /// Legacy weighted-average data from `bazaar_buy_costs.json` is not used
+    /// by this path; only locally observed collected BUY lots can become cost
+    /// basis for realized SELL profit.
     pub fn record_buy_cost(&self, item_name: &str, price_per_unit: f64, amount: u64) {
+        if amount == 0 || price_per_unit <= 0.0 {
+            warn!(
+                "[BazaarProfit] Ignoring invalid BUY lot for {} — amount={}, ppu={:.2}",
+                item_name, amount, price_per_unit
+            );
+            return;
+        }
         let key = normalize_for_match(item_name);
-        let mut costs = self.last_buy_costs.write();
-        let entry = costs.entry(key).or_insert((0.0, 0));
-        let old_total_cost = entry.0 * entry.1 as f64;
-        let new_total_cost = price_per_unit * amount as f64;
-        let combined_amount = entry.1 + amount;
-        entry.0 = if combined_amount > 0 {
-            (old_total_cost + new_total_cost) / combined_amount as f64
-        } else {
-            0.0
+        let lot = BuyCostLot {
+            price_per_unit,
+            amount,
+            collected_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
         };
-        entry.1 = combined_amount;
-        drop(costs);
-        self.save_buy_costs_to_disk();
+        self.buy_cost_lots
+            .write()
+            .entry(key)
+            .or_default()
+            .push_back(lot);
+        self.save_buy_cost_lots_to_disk();
     }
 
-    /// Consume and return the stored buy cost for an item (if any).
-    /// Used when a sell offer is collected to compute profit/loss.
+    /// Consume FIFO lots for a SELL collection and return a complete audit row.
+    /// If not enough locally collected BUY lots exist, nothing is consumed and
+    /// the sell is marked `UNKNOWN_COST_BASIS`; its realized profit is zero.
+    pub fn account_sell_collect(
+        &self,
+        item_name: &str,
+        sold_amount: u64,
+        claimed_coins_after_tax: f64,
+        gross_list_value: Option<f64>,
+    ) -> SellProfitAudit {
+        let key = normalize_for_match(item_name);
+        let available: u64 = self
+            .buy_cost_lots
+            .read()
+            .get(&key)
+            .map(|lots| lots.iter().map(|lot| lot.amount).sum())
+            .unwrap_or(0);
+
+        if sold_amount == 0 || available < sold_amount {
+            let reason = if sold_amount == 0 {
+                "sold_amount_zero".to_string()
+            } else {
+                format!(
+                    "insufficient_fifo_lots: needed {}, available {}",
+                    sold_amount, available
+                )
+            };
+            let audit = SellProfitAudit {
+                item_name: item_name.to_string(),
+                sold_amount,
+                claimed_coins_after_tax,
+                gross_list_value,
+                lots_used: Vec::new(),
+                cost_basis_total: 0.0,
+                cost_basis_status: CostBasisStatus::UnknownCostBasis,
+                realized_profit: 0,
+                reason: Some(reason),
+            };
+            let mut state = self.profit_audit.write();
+            state.unknown_cost_basis_sell_total_count += 1;
+            state.last_sell_audit = Some(audit.clone());
+            return audit;
+        }
+
+        let mut remaining = sold_amount;
+        let mut lots_used = Vec::new();
+        let mut cost_basis_total = 0.0;
+        {
+            let mut all_lots = self.buy_cost_lots.write();
+            let lots = all_lots.entry(key.clone()).or_default();
+            while remaining > 0 {
+                let mut lot = lots.pop_front().expect("availability checked above");
+                let used_amount = remaining.min(lot.amount);
+                let total_cost = lot.price_per_unit * used_amount as f64;
+                lots_used.push(BuyCostLotUsage {
+                    price_per_unit: lot.price_per_unit,
+                    amount: used_amount,
+                    total_cost,
+                });
+                cost_basis_total += total_cost;
+                remaining -= used_amount;
+                lot.amount -= used_amount;
+                if lot.amount > 0 {
+                    lots.push_front(lot);
+                }
+            }
+            if lots.is_empty() {
+                all_lots.remove(&key);
+            }
+        }
+        self.save_buy_cost_lots_to_disk();
+
+        let realized_profit = (claimed_coins_after_tax - cost_basis_total).round() as i64;
+        let audit = SellProfitAudit {
+            item_name: item_name.to_string(),
+            sold_amount,
+            claimed_coins_after_tax,
+            gross_list_value,
+            lots_used,
+            cost_basis_total,
+            cost_basis_status: CostBasisStatus::Known,
+            realized_profit,
+            reason: None,
+        };
+        let mut state = self.profit_audit.write();
+        state.current_fifo_realized_profit_total += realized_profit;
+        state.last_sell_audit = Some(audit.clone());
+        audit
+    }
+
+    /// Compatibility helper for older tests/callers: consume an entire local
+    /// FIFO balance and return its weighted average. Production SELL accounting
+    /// must use `account_sell_collect` so partial fills do not corrupt lots.
+    #[cfg(test)]
     pub fn take_buy_cost(&self, item_name: &str) -> Option<(f64, u64)> {
-        let result = self
-            .last_buy_costs
-            .write()
-            .remove(&normalize_for_match(item_name));
-        self.save_buy_costs_to_disk();
-        result
+        let key = normalize_for_match(item_name);
+        let lots = self.buy_cost_lots.write().remove(&key)?;
+        let amount: u64 = lots.iter().map(|lot| lot.amount).sum();
+        if amount == 0 {
+            return None;
+        }
+        let total: f64 = lots
+            .iter()
+            .map(|lot| lot.price_per_unit * lot.amount as f64)
+            .sum();
+        Some((total / amount as f64, amount))
+    }
+
+    pub fn record_ignored_legacy_profit(&self, profit: i64, source: &str) {
+        self.profit_audit.write().ignored_legacy_profit_total += profit;
+        debug!(
+            "[BazaarProfitAudit] Ignored legacy/external BZ profit from {}: {} coins",
+            source, profit
+        );
+    }
+
+    pub fn profit_audit_snapshot(&self) -> BazaarProfitAuditSnapshot {
+        let state = self.profit_audit.read().clone();
+        let orders = self.orders.read();
+        let open_buy_capital = orders
+            .iter()
+            .filter(|o| o.is_buy_order)
+            .map(|o| o.price_per_unit * o.amount as f64)
+            .sum();
+        let open_sell_value = orders
+            .iter()
+            .filter(|o| !o.is_buy_order)
+            .map(|o| o.price_per_unit * o.amount as f64)
+            .sum();
+        let remaining_cost_lots = self
+            .buy_cost_lots
+            .read()
+            .iter()
+            .map(|(item, lots)| (item.clone(), lots.iter().cloned().collect()))
+            .collect();
+        BazaarProfitAuditSnapshot {
+            current_fifo_realized_profit_total: state.current_fifo_realized_profit_total,
+            unknown_cost_basis_sell_total_count: state.unknown_cost_basis_sell_total_count,
+            ignored_legacy_profit_total: state.ignored_legacy_profit_total,
+            open_buy_capital,
+            open_sell_value,
+            remaining_cost_lots,
+            web_graph_source: "local_fifo_known_cost_basis_only".to_string(),
+            last_sell_audit: state.last_sell_audit,
+        }
     }
 
     /// Replace the per-item profit map with data parsed from `/cofl bz l`.
@@ -432,13 +636,18 @@ impl BazaarOrderTracker {
         }
     }
 
-    fn save_buy_costs_to_disk(&self) {
+    fn save_buy_cost_lots_to_disk(&self) {
         #[cfg(test)]
         return;
         #[cfg(not(test))]
         {
-            let costs = self.last_buy_costs.read().clone();
-            let path = Self::persistence_dir().join(BUY_COSTS_FILE);
+            let costs: HashMap<String, Vec<BuyCostLot>> = self
+                .buy_cost_lots
+                .read()
+                .iter()
+                .map(|(item, lots)| (item.clone(), lots.iter().cloned().collect()))
+                .collect();
+            let path = Self::persistence_dir().join(BUY_COST_LOTS_FILE);
             if let Err(e) = std::fs::create_dir_all(Self::persistence_dir()) {
                 warn!("[BazaarTracker] Failed to create persistence dir: {}", e);
                 return;
@@ -449,7 +658,10 @@ impl BazaarOrderTracker {
                         warn!("[BazaarTracker] Failed to write {}: {}", path.display(), e);
                     }
                 }
-                Err(e) => warn!("[BazaarTracker] Failed to serialize buy costs: {}", e),
+                Err(e) => warn!(
+                    "[BazaarTracker] Failed to serialize FIFO buy-cost lots: {}",
+                    e
+                ),
             }
         }
     }
@@ -476,23 +688,37 @@ impl BazaarOrderTracker {
                 ),
             }
         }
-        let costs_path = Self::persistence_dir().join(BUY_COSTS_FILE);
-        if costs_path.exists() {
-            match std::fs::read_to_string(&costs_path) {
-                Ok(json) => match serde_json::from_str::<HashMap<String, (f64, u64)>>(&json) {
+        let legacy_costs_path = Self::persistence_dir().join(LEGACY_BUY_COSTS_FILE);
+        if legacy_costs_path.exists() {
+            warn!(
+                "[BazaarTracker] Ignoring legacy weighted-average buy-cost file {} for FIFO profit",
+                legacy_costs_path.display()
+            );
+        }
+
+        let lots_path = Self::persistence_dir().join(BUY_COST_LOTS_FILE);
+        if lots_path.exists() {
+            match std::fs::read_to_string(&lots_path) {
+                Ok(json) => match serde_json::from_str::<HashMap<String, Vec<BuyCostLot>>>(&json) {
                     Ok(costs) => {
-                        debug!("[BazaarTracker] Loaded {} buy costs from disk", costs.len());
-                        *self.last_buy_costs.write() = costs;
+                        debug!(
+                            "[BazaarTracker] Loaded FIFO buy-cost lots for {} items",
+                            costs.len()
+                        );
+                        *self.buy_cost_lots.write() = costs
+                            .into_iter()
+                            .map(|(item, lots)| (item, VecDeque::from(lots)))
+                            .collect();
                     }
                     Err(e) => warn!(
                         "[BazaarTracker] Failed to parse {}: {}",
-                        costs_path.display(),
+                        lots_path.display(),
                         e
                     ),
                 },
                 Err(e) => warn!(
                     "[BazaarTracker] Failed to read {}: {}",
-                    costs_path.display(),
+                    lots_path.display(),
                     e
                 ),
             }
@@ -512,6 +738,123 @@ pub fn normalize_for_match_pub(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crystalized_moonlight_fifo_profit_is_positive() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.record_buy_cost("Crystalized Moonlight", 460_003.1, 10);
+
+        let audit = tracker.account_sell_collect(
+            "Crystalized Moonlight",
+            10,
+            5_065_283.0,
+            Some(5_129_400.0),
+        );
+
+        assert_eq!(audit.cost_basis_status, CostBasisStatus::Known);
+        assert_eq!(audit.cost_basis_total.round() as i64, 4_600_031);
+        assert_eq!(audit.realized_profit, 465_252);
+        assert_eq!(
+            tracker
+                .profit_audit_snapshot()
+                .current_fifo_realized_profit_total,
+            465_252
+        );
+    }
+
+    #[test]
+    fn sell_without_enough_lots_is_unknown_and_does_not_change_profit() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.record_buy_cost("Crystalized Moonlight", 460_003.1, 10);
+
+        let audit = tracker.account_sell_collect(
+            "Crystalized Moonlight",
+            17,
+            8_610_000.0,
+            Some(8_720_000.0),
+        );
+
+        assert_eq!(audit.cost_basis_status, CostBasisStatus::UnknownCostBasis);
+        assert_eq!(audit.realized_profit, 0);
+        let snapshot = tracker.profit_audit_snapshot();
+        assert_eq!(snapshot.current_fifo_realized_profit_total, 0);
+        assert_eq!(snapshot.unknown_cost_basis_sell_total_count, 1);
+        assert_eq!(
+            snapshot.remaining_cost_lots["crystalized moonlight"][0].amount,
+            10
+        );
+    }
+
+    #[test]
+    fn legacy_bz_list_profit_is_diagnostic_only() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        let mut legacy = HashMap::new();
+        legacy.insert("Crystalized Moonlight".to_string(), (-5_830_000, 1));
+        tracker.set_bz_list_profits(legacy);
+        tracker.record_ignored_legacy_profit(-5_830_000, "/cofl bz l");
+
+        let audit = tracker.account_sell_collect(
+            "Crystalized Moonlight",
+            17,
+            8_610_000.0,
+            Some(8_720_000.0),
+        );
+
+        let snapshot = tracker.profit_audit_snapshot();
+        assert_eq!(audit.cost_basis_status, CostBasisStatus::UnknownCostBasis);
+        assert_eq!(snapshot.current_fifo_realized_profit_total, 0);
+        assert_eq!(snapshot.ignored_legacy_profit_total, -5_830_000);
+    }
+
+    #[test]
+    fn partial_fill_leaves_remaining_fifo_lot() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.record_buy_cost("Coal", 100.0, 10);
+
+        let audit = tracker.account_sell_collect("Coal", 4, 500.0, Some(500.0));
+
+        assert_eq!(audit.cost_basis_status, CostBasisStatus::Known);
+        assert_eq!(audit.cost_basis_total, 400.0);
+        let snapshot = tracker.profit_audit_snapshot();
+        assert_eq!(snapshot.remaining_cost_lots["coal"][0].amount, 6);
+        assert_eq!(
+            snapshot.remaining_cost_lots["coal"][0].price_per_unit,
+            100.0
+        );
+    }
+
+    #[test]
+    fn multiple_lots_are_consumed_fifo() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.record_buy_cost("Diamond", 100.0, 5);
+        tracker.record_buy_cost("Diamond", 120.0, 5);
+
+        let audit = tracker.account_sell_collect("Diamond", 8, 1_000.0, Some(1_000.0));
+
+        assert_eq!(audit.cost_basis_status, CostBasisStatus::Known);
+        assert_eq!(audit.cost_basis_total, 860.0);
+        assert_eq!(audit.lots_used[0].amount, 5);
+        assert_eq!(audit.lots_used[0].price_per_unit, 100.0);
+        assert_eq!(audit.lots_used[1].amount, 3);
+        assert_eq!(audit.lots_used[1].price_per_unit, 120.0);
+        let snapshot = tracker.profit_audit_snapshot();
+        assert_eq!(snapshot.remaining_cost_lots["diamond"][0].amount, 2);
+        assert_eq!(
+            snapshot.remaining_cost_lots["diamond"][0].price_per_unit,
+            120.0
+        );
+    }
+
+    #[test]
+    fn audit_snapshot_documents_graph_source() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        let snapshot = tracker.profit_audit_snapshot();
+        assert_eq!(
+            snapshot.web_graph_source,
+            "local_fifo_known_cost_basis_only"
+        );
+        assert_eq!(snapshot.current_fifo_realized_profit_total, 0);
+    }
 
     #[test]
     fn add_and_remove_order() {

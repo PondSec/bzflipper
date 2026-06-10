@@ -310,6 +310,7 @@ a{color:var(--accent2);text-decoration:none}
             <button class="btn btn-sm" style="background:var(--accent);color:#fff" onclick="claimBzOrders()">📋 Claim BZ Orders</button>
         </div>
         <div style="display:flex;gap:10px;margin-bottom:16px">
+            <button class="btn btn-sm" id="btn-end-phase" style="background:#f39c12;color:#1a1a1a" onclick="startEndPhase()">🏁 End Phase</button>
             <button class="btn btn-sm" id="btn-disconnect" style="background:#e74c3c;color:#fff" onclick="toggleConnection()">🔌 Disconnect</button>
             <button class="btn btn-sm" style="background:#c0392b;color:#fff" onclick="killSession()">💀 Kill Session</button>
         </div>
@@ -757,6 +758,12 @@ function renderAccounts() {
 
 async function pauseMacro() { await fetch('/api/pause', {method:'POST'}); fetchStatus(); }
 async function resumeMacro() { await fetch('/api/resume', {method:'POST'}); fetchStatus(); }
+
+async function startEndPhase() {
+    if (!confirm('Start end phase? The bot will stop buying, try to sell/claim remaining items, then pause.')) return;
+    await fetch('/api/end_phase', {method:'POST'});
+    fetchStatus();
+}
 
 async function toggleAnonymize(enabled) {
     await fetch('/api/toggle_anonymize', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})});
@@ -1513,6 +1520,9 @@ async function fetchProfit() {
         $('ah-per-hour').textContent = hours > 0 ? formatProfitLabel(d.ah_total / hours) : '0';
 
         $('bz-profit-total').textContent = formatProfitLabel(d.bz_total);
+        if (d.bazaar_audit) {
+            console.debug('Bazaar profit audit', d.bazaar_audit);
+        }
         $('bz-uptime').textContent = upStr;
         $('bz-per-hour').textContent = hours > 0 ? formatProfitLabel(d.bz_total / hours) : '0';
 

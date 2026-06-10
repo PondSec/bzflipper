@@ -156,6 +156,7 @@ struct ProfitResponse {
     ah_total: i64,
     bz_total: i64,
     uptime_seconds: u64,
+    bazaar_audit: crate::bazaar_tracker::BazaarProfitAuditSnapshot,
 }
 
 /// Default auction duration used when the client doesn't provide one.
@@ -285,6 +286,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/status", get(get_status))
         .route("/api/pause", get(pause_macro).post(pause_macro))
         .route("/api/resume", get(resume_macro).post(resume_macro))
+        .route("/api/end_phase", axum::routing::post(end_phase))
         .route("/api/inventory", get(get_inventory))
         .route("/api/game-view", get(get_game_view))
         .route("/api/toggle_ah", axum::routing::post(toggle_ah))
@@ -533,6 +535,56 @@ async fn resume_macro(State(s): State<WebSharedState>) -> impl IntoResponse {
     print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
     StatusCode::OK
+}
+
+async fn end_phase(State(s): State<WebSharedState>) -> impl IntoResponse {
+    info!("[WebGUI] End phase requested — stop buying, sell inventory, then pause");
+
+    s.flip_intake_paused.store(true, Ordering::Relaxed);
+    s.enable_ah_flips.store(false, Ordering::Relaxed);
+    s.enable_bazaar_flips.store(false, Ordering::Relaxed);
+    s.bazaar_flips_paused.store(true, Ordering::Relaxed);
+    s.macro_paused.store(false, Ordering::Relaxed);
+    s.command_queue.clear();
+
+    let msg = "[BAF Web] End phase: buying disabled, selling/claiming queued, macro will pause after cleanup".to_string();
+    print_mc_chat(&msg);
+    let _ = s.chat_tx.send(msg);
+
+    s.command_queue.enqueue(
+        CommandType::ClaimPurchasedItem,
+        CommandPriority::Critical,
+        false,
+    );
+    s.command_queue.enqueue(
+        CommandType::SellInventoryBz,
+        CommandPriority::Critical,
+        false,
+    );
+    s.command_queue.enqueue(
+        CommandType::ManageOrders {
+            cancel_open: false,
+            target_item: None,
+        },
+        CommandPriority::Critical,
+        false,
+    );
+    process_chat_input("/cofl sellinventory", &s).await;
+
+    let macro_paused = s.macro_paused.clone();
+    let chat_tx = s.chat_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+        macro_paused.store(true, Ordering::Relaxed);
+        let paused_msg = "[BAF Web] End phase cleanup window elapsed — macro paused".to_string();
+        print_mc_chat(&paused_msg);
+        let _ = chat_tx.send(paused_msg);
+    });
+
+    (
+        StatusCode::OK,
+        "End phase started: buying disabled, selling queued, pause scheduled",
+    )
 }
 
 async fn get_inventory(State(s): State<WebSharedState>) -> impl IntoResponse {
@@ -1494,6 +1546,7 @@ async fn get_profit(State(s): State<WebSharedState>) -> Json<ProfitResponse> {
         ah_total,
         bz_total,
         uptime_seconds: s.previous_session_secs + s.started_at.elapsed().as_secs(),
+        bazaar_audit: s.bazaar_tracker.profit_audit_snapshot(),
     })
 }
 
