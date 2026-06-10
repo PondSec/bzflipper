@@ -400,7 +400,7 @@ public class TPM
 
 }
 
-/// FBAF (Frikadellen BAF) default settings for the managed backend UI.
+/// PursePilot default settings for the managed backend UI.
 /// Analogous to TPM.NormalDefault but tuned for the Rust BAF client.
 /// Field names and defaults match the Config struct in src/config/types.rs.
 public class FBAF

@@ -1,6 +1,6 @@
 <div align="center">
 
-# Frikadellen BAF
+# PursePilot
 
 ### Bazaar & Auction Flipper for Hypixel Skyblock
 
@@ -8,7 +8,7 @@ A high-performance, Rust-powered macro that automates auction house sniping, baz
 
 [![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?logo=discord&logoColor=white)](https://discord.gg/42DvX6T9jh)
 [![Website](https://img.shields.io/badge/Website-auctionflipper.bz-blue)](https://auctionflipper.bz)
-[![Releases](https://img.shields.io/github/v/release/TreXito/frikadellen-baf-121?label=Latest%20Release)](../../releases/latest)
+[![Releases](https://img.shields.io/github/v/release/PondSec/PursePilot?label=Latest%20Release)](../../releases/latest)
 [![License](https://img.shields.io/badge/License-AGPLv3-green)](#license)
 
 </div>
@@ -78,10 +78,10 @@ Go to the [Releases page](../../releases/latest) and download the binary for you
 
 | Platform | Binary | Loader (auto-updater) |
 |---|---|---|
-| Linux x86_64 | `frikadellen_baf-linux-x86_64` | `FrikadellenBAF-loader-linux-x86_64` |
-| macOS Intel | `frikadellen_baf-macos-x86_64` | `FrikadellenBAF-loader-macos-x86_64` |
-| macOS Apple Silicon | `frikadellen_baf-macos-aarch64` | `FrikadellenBAF-loader-macos-aarch64` |
-| Windows | `frikadellen_baf-windows-x86_64.exe` | `FrikadellenBAF-loader-windows-x86_64.exe` |
+| Linux x86_64 | `purse_pilot-linux-x86_64` | `PursePilot-loader-linux-x86_64` |
+| macOS Intel | `purse_pilot-macos-x86_64` | `PursePilot-loader-macos-x86_64` |
+| macOS Apple Silicon | `purse_pilot-macos-aarch64` | `PursePilot-loader-macos-aarch64` |
+| Windows | `purse_pilot-windows-x86_64.exe` | `PursePilot-loader-windows-x86_64.exe` |
 
 > **Tip:** The **Loader** binary is recommended — it automatically checks for and downloads the latest version every time you run it.
 
@@ -90,15 +90,15 @@ Go to the [Releases page](../../releases/latest) and download the binary for you
 Using the loader (recommended):
 
 ```bash
-wget https://github.com/TreXito/frikadellen-baf-121/releases/latest/download/FrikadellenBAF-loader-linux-x86_64 && chmod +x FrikadellenBAF-loader-linux-x86_64
-./FrikadellenBAF-loader-linux-x86_64
+wget https://github.com/PondSec/releases/latest/download/PursePilot-loader-linux-x86_64 && chmod +x PursePilot-loader-linux-x86_64
+./PursePilot-loader-linux-x86_64
 ```
 
 Or the standalone binary:
 
 ```bash
-wget https://github.com/TreXito/frikadellen-baf-121/releases/latest/download/frikadellen_baf-linux-x86_64 && chmod +x frikadellen_baf-linux-x86_64
-./frikadellen_baf-linux-x86_64
+wget https://github.com/PondSec/releases/latest/download/purse_pilot-linux-x86_64 && chmod +x purse_pilot-linux-x86_64
+./purse_pilot-linux-x86_64
 ```
 
 ### Windows
@@ -111,8 +111,8 @@ wget https://github.com/TreXito/frikadellen-baf-121/releases/latest/download/fri
 1. Download the binary for your chip (Intel or Apple Silicon) from [Releases](../../releases/latest)
 2. Open Terminal, navigate to the download folder, and run:
    ```bash
-   chmod +x frikadellen_baf-macos-*
-   ./frikadellen_baf-macos-*
+   chmod +x purse_pilot-macos-*
+   ./purse_pilot-macos-*
    ```
    If macOS blocks it, go to **System Settings → Privacy & Security** and click **Allow Anyway**.
 
@@ -322,20 +322,20 @@ rustup install nightly
 rustup default nightly
 
 # Clone and build
-git clone https://github.com/TreXito/frikadellen-baf-121.git
-cd frikadellen-baf-121
+git clone https://github.com/PondSec.git
+cd PursePilot
 cargo build --release
 ```
 
-The compiled binary will be at `target/release/frikadellen_baf`.
+The compiled binary will be at `target/release/purse_pilot`.
 
 ### Launcher Script
 
 A convenience script is included in the repo:
 
 ```bash
-chmod +x frikadellen-baf-121
-./frikadellen-baf-121
+chmod +x PursePilot
+./PursePilot
 ```
 
 It checks for an existing binary, builds from source if needed, and runs the bot.

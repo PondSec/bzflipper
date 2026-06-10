@@ -396,7 +396,7 @@ async fn index_page(State(s): State<WebSharedState>) -> Html<String> {
         0.0
     };
 
-    let og_title = "Frikadellen BAF — Control Panel";
+    let og_title = "PursePilot — Control Panel";
     let og_description = format!(
         "💰 Total Profit: {} coins | ⏱️ P/H: {} coins/h | 🕐 Uptime: {}",
         format_og_number(total as f64),
@@ -538,7 +538,8 @@ async fn resume_macro(State(s): State<WebSharedState>) -> impl IntoResponse {
 }
 
 async fn end_phase(State(s): State<WebSharedState>) -> impl IntoResponse {
-    info!("[WebGUI] End phase requested — stop buying, sell inventory, then pause");
+    info!("[BAF][END_PHASE] END_PHASE_START requested — stop buying, sell inventory, then pause");
+    s.bazaar_tracker.set_end_phase_state("END_PHASE_START");
 
     s.flip_intake_paused.store(true, Ordering::Relaxed);
     s.enable_ah_flips.store(false, Ordering::Relaxed);
@@ -546,21 +547,26 @@ async fn end_phase(State(s): State<WebSharedState>) -> impl IntoResponse {
     s.bazaar_flips_paused.store(true, Ordering::Relaxed);
     s.macro_paused.store(false, Ordering::Relaxed);
     s.command_queue.clear();
+    s.bazaar_tracker.set_end_phase_state("STOP_NEW_BUYS");
 
-    let msg = "[BAF Web] End phase: buying disabled, selling/claiming queued, macro will pause after cleanup".to_string();
+    let msg = "[PursePilot Web] End phase: buying disabled; claim/cancel/list/monitor cleanup loop started".to_string();
     print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
 
+    s.bazaar_tracker.set_end_phase_state("CLAIM_FILLED_BUYS");
     s.command_queue.enqueue(
         CommandType::ClaimPurchasedItem,
         CommandPriority::Critical,
         false,
     );
+    s.bazaar_tracker
+        .set_end_phase_state("PLACE_SELLS_FOR_COSTLOTS");
     s.command_queue.enqueue(
         CommandType::SellInventoryBz,
         CommandPriority::Critical,
         false,
     );
+    s.bazaar_tracker.set_end_phase_state("MONITOR_SELLS");
     s.command_queue.enqueue(
         CommandType::ManageOrders {
             cancel_open: false,
@@ -573,17 +579,48 @@ async fn end_phase(State(s): State<WebSharedState>) -> impl IntoResponse {
 
     let macro_paused = s.macro_paused.clone();
     let chat_tx = s.chat_tx.clone();
+    let bazaar_tracker = s.bazaar_tracker.clone();
+    let command_queue = s.command_queue.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+        use crate::types::{CommandPriority, CommandType};
+        for step in [
+            "CANCEL_OR_CLAIM_OPEN_BUYS",
+            "CLAIM_FILLED_SELLS",
+            "HANDLE_STALE_SELLS",
+        ] {
+            bazaar_tracker.set_end_phase_state(step);
+            tracing::info!("[BAF][END_PHASE] {}", step);
+            command_queue.enqueue(
+                CommandType::ManageOrders {
+                    cancel_open: step == "CANCEL_OR_CLAIM_OPEN_BUYS",
+                    target_item: None,
+                },
+                CommandPriority::Critical,
+                false,
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+        let snapshot = bazaar_tracker.profit_audit_snapshot();
+        if snapshot.open_buy_capital <= 0.0
+            && snapshot.active_buy_orders == 0
+            && snapshot.items_waiting_for_sell.is_empty()
+        {
+            bazaar_tracker.set_end_phase_state("DONE");
+        } else {
+            bazaar_tracker.set_end_phase_state("DONE_UNRESOLVED_COSTLOTS_OR_SELLS");
+        }
         macro_paused.store(true, Ordering::Relaxed);
-        let paused_msg = "[BAF Web] End phase cleanup window elapsed — macro paused".to_string();
+        let paused_msg = format!(
+            "[PursePilot Web] End phase cleanup window elapsed — macro paused ({})",
+            bazaar_tracker.end_phase_state()
+        );
         print_mc_chat(&paused_msg);
         let _ = chat_tx.send(paused_msg);
     });
 
     (
         StatusCode::OK,
-        "End phase started: buying disabled, selling queued, pause scheduled",
+        "End phase started: STOP_NEW_BUYS → claim/cancel/list/monitor → DONE/DONE_UNRESOLVED",
     )
 }
 
@@ -878,6 +915,7 @@ async fn claim_purchases(State(s): State<WebSharedState>) -> impl IntoResponse {
     print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
 
+    s.bazaar_tracker.set_end_phase_state("CLAIM_FILLED_BUYS");
     s.command_queue.enqueue(
         CommandType::ClaimPurchasedItem,
         CommandPriority::Critical,
@@ -894,6 +932,8 @@ async fn collect_bz_orders(State(s): State<WebSharedState>) -> impl IntoResponse
     print_mc_chat(&msg);
     let _ = s.chat_tx.send(msg);
 
+    s.bazaar_tracker
+        .set_end_phase_state("PLACE_SELLS_FOR_COSTLOTS");
     s.command_queue.enqueue(
         CommandType::SellInventoryBz,
         CommandPriority::Critical,

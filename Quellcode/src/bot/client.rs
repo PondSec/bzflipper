@@ -249,7 +249,7 @@ fn on_container_set_content(
 ///
 /// ## References
 ///
-/// - Original TypeScript: `/tmp/frikadellen-baf/src/BAF.ts`
+/// - Original TypeScript: `/tmp/PursePilot/src/BAF.ts`
 /// - Azalea examples: https://github.com/azalea-rs/azalea/tree/main/azalea/examples
 #[derive(Clone)]
 pub struct BotClient {
@@ -525,7 +525,7 @@ impl BotClient {
     /// # Example
     ///
     /// ```no_run
-    /// use frikadellen_baf::bot::BotClient;
+    /// use purse_pilot::bot::BotClient;
     ///
     /// #[tokio::main]
     /// async fn main() {

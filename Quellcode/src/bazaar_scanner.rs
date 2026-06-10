@@ -168,6 +168,232 @@ pub struct LocalBazaarScanConfig {
     pub inventory_sellable_stacks: u64,
     pub max_pending_buy_stacks: u64,
     pub buy_sell_balance_limit: f64,
+    pub total_cost_lot_value: f64,
+    pub open_buy_capital: f64,
+    pub open_sell_value: f64,
+    pub max_cost_lot_capital_ratio: f64,
+    pub max_open_buy_capital_ratio: f64,
+    pub per_item_exposure_cap: u64,
+    pub min_reprice_profit_improvement: f64,
+    pub min_reprice_interval_seconds: u64,
+    pub max_reprices_per_item_per_hour: u64,
+    pub reprice_cooldown_seconds: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PracticalItemMetrics {
+    pub expected_net_profit_after_tax: f64,
+    pub expected_cycle_minutes: f64,
+    pub buy_volume: u64,
+    pub sell_volume: u64,
+    pub moving_week: u64,
+    pub order_count: u64,
+    pub volume_value_hour: f64,
+    pub avg_buy_fill_seconds: f64,
+    pub avg_sell_fill_seconds: f64,
+    pub current_open_buy_capital: f64,
+    pub current_open_sell_value: f64,
+    pub current_cost_lot_value: f64,
+    pub max_cost_lot_age_seconds: u64,
+    pub successful_flips: u64,
+    pub failed_flips: u64,
+    pub reprice_count: u64,
+    pub cancel_count: u64,
+    pub failed_search_count: u64,
+    pub cannot_afford_count: u64,
+    pub unknown_cost_basis_count: u64,
+    pub negative_profit_block_count: u64,
+    pub realized_profit_last_10m: i64,
+    pub realized_profit_last_30m: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PracticalScoreBreakdown {
+    pub score: f64,
+    pub sell_through_score: f64,
+    pub buy_fill_score: f64,
+    pub liquidity_score: f64,
+    pub reliability_score: f64,
+    pub capital_efficiency_score: f64,
+    pub recent_success_score: f64,
+    pub expected_cycle_minutes: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CandidateDecision {
+    Accept,
+    Reject(&'static str),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepriceDecision {
+    pub allowed: bool,
+    pub reason: Option<&'static str>,
+}
+
+pub fn practical_score(metrics: &PracticalItemMetrics) -> PracticalScoreBreakdown {
+    let cycle = metrics.expected_cycle_minutes.max(1.0);
+    let sell_through_score = if metrics.avg_sell_fill_seconds > 0.0 {
+        (900.0 / metrics.avg_sell_fill_seconds.max(60.0)).clamp(0.10, 1.50)
+    } else {
+        0.65
+    } * if metrics.current_cost_lot_value > 0.0 {
+        (1.0 / (1.0 + metrics.current_cost_lot_value / 5_000_000.0)).clamp(0.15, 1.0)
+    } else {
+        1.0
+    } * if metrics.max_cost_lot_age_seconds > 1800 {
+        0.35
+    } else {
+        1.0
+    };
+
+    let buy_fill_score = if metrics.avg_buy_fill_seconds > 0.0 {
+        (600.0 / metrics.avg_buy_fill_seconds.max(30.0)).clamp(0.20, 1.30)
+    } else {
+        0.75
+    } * (1.0
+        / (1.0 + (metrics.reprice_count + metrics.cancel_count) as f64 / 6.0));
+
+    let volume_units = metrics.buy_volume.min(metrics.sell_volume) as f64 / 25_000.0;
+    let liquidity_score = (volume_units.sqrt()
+        * (metrics.moving_week as f64 / 1_000_000.0).sqrt()
+        * (metrics.order_count as f64 / 40.0).sqrt()
+        * (metrics.volume_value_hour / 50_000_000.0).sqrt())
+    .clamp(0.05, 1.35);
+
+    let failures = metrics.failed_flips
+        + metrics.failed_search_count
+        + metrics.cannot_afford_count
+        + metrics.unknown_cost_basis_count
+        + metrics.negative_profit_block_count
+        + metrics.cancel_count;
+    let reliability_score = ((metrics.successful_flips + 1) as f64
+        / (metrics.successful_flips + failures + 1) as f64)
+        .clamp(0.05, 1.20);
+
+    let bound_capital = (metrics.current_open_buy_capital
+        + metrics.current_open_sell_value
+        + metrics.current_cost_lot_value)
+        .max(metrics.expected_net_profit_after_tax.max(1.0));
+    let capital_efficiency_score =
+        (metrics.expected_net_profit_after_tax / bound_capital * 10.0).clamp(0.05, 1.25);
+
+    let recent_success_score = if metrics.realized_profit_last_10m > 0 {
+        1.35
+    } else if metrics.realized_profit_last_30m > 0 {
+        1.15
+    } else if metrics.current_cost_lot_value > 0.0 && metrics.successful_flips == 0 {
+        0.35
+    } else {
+        0.85
+    };
+
+    let score = metrics.expected_net_profit_after_tax.max(0.0)
+        * sell_through_score
+        * buy_fill_score
+        * liquidity_score
+        * reliability_score
+        * capital_efficiency_score
+        * recent_success_score
+        / cycle;
+
+    PracticalScoreBreakdown {
+        score,
+        sell_through_score,
+        buy_fill_score,
+        liquidity_score,
+        reliability_score,
+        capital_efficiency_score,
+        recent_success_score,
+        expected_cycle_minutes: cycle,
+    }
+}
+
+pub fn evaluate_position_limits(
+    item_open_buy_capital: f64,
+    item_cost_lot_value: f64,
+    item_open_sell_value: f64,
+    total_open_buy_capital: f64,
+    total_cost_lot_value: f64,
+    total_open_sell_value: f64,
+    config: &LocalBazaarScanConfig,
+) -> CandidateDecision {
+    let total_capital = config.total_capital.max(1) as f64;
+    if total_cost_lot_value > total_capital * config.max_cost_lot_capital_ratio.clamp(0.05, 1.0) {
+        return CandidateDecision::Reject("TOO_MUCH_OPEN_COST_BASIS");
+    }
+    if total_open_buy_capital > total_capital * config.max_open_buy_capital_ratio.clamp(0.05, 1.0) {
+        return CandidateDecision::Reject("TOO_MUCH_OPEN_CAPITAL");
+    }
+    let active_limit = total_capital * config.active_capital_ratio.clamp(0.05, 1.0);
+    if total_open_buy_capital + total_cost_lot_value + total_open_sell_value > active_limit {
+        return CandidateDecision::Reject("POSITION_LIMIT");
+    }
+    let per_item_cap = if config.per_item_exposure_cap > 0 {
+        config.per_item_exposure_cap as f64
+    } else {
+        config.max_capital_per_item as f64
+    };
+    if item_open_buy_capital + item_cost_lot_value + item_open_sell_value >= per_item_cap {
+        return CandidateDecision::Reject("POSITION_LIMIT");
+    }
+    if item_cost_lot_value > 0.0 || item_open_sell_value > 0.0 {
+        return CandidateDecision::Reject("COST_LOTS_ALREADY_OPEN");
+    }
+    CandidateDecision::Accept
+}
+
+pub fn should_reprice(
+    order_age_seconds: u64,
+    seconds_since_last_reprice: Option<u64>,
+    reprices_this_hour: u64,
+    old_expected_profit: f64,
+    new_expected_profit: f64,
+    has_open_cost_lots: bool,
+    config: &LocalBazaarScanConfig,
+) -> RepriceDecision {
+    if order_age_seconds < config.min_reprice_interval_seconds {
+        return RepriceDecision {
+            allowed: false,
+            reason: Some("ORDER_TOO_YOUNG"),
+        };
+    }
+    if let Some(elapsed) = seconds_since_last_reprice {
+        if elapsed < config.reprice_cooldown_seconds {
+            return RepriceDecision {
+                allowed: false,
+                reason: Some("REPRICE_COOLDOWN"),
+            };
+        }
+    }
+    if reprices_this_hour >= config.max_reprices_per_item_per_hour {
+        return RepriceDecision {
+            allowed: false,
+            reason: Some("TOO_MANY_REPRICES"),
+        };
+    }
+    if new_expected_profit - old_expected_profit < config.min_reprice_profit_improvement {
+        return RepriceDecision {
+            allowed: false,
+            reason: Some("LOW_REPRICE_IMPROVEMENT"),
+        };
+    }
+    if new_expected_profit < old_expected_profit * 0.70 {
+        return RepriceDecision {
+            allowed: false,
+            reason: Some("PROFIT_EROSION"),
+        };
+    }
+    if has_open_cost_lots {
+        return RepriceDecision {
+            allowed: false,
+            reason: Some("COST_LOTS_ALREADY_OPEN"),
+        };
+    }
+    RepriceDecision {
+        allowed: true,
+        reason: None,
+    }
 }
 
 pub async fn fetch_best_flips(
@@ -213,6 +439,25 @@ pub async fn fetch_best_flips(
     .max(0.0);
     let reserved_capital = (config.total_capital as f64 - active_capital).max(0.0);
     let useful_limit = limit.max(config.max_items.max(1));
+    if config.total_capital > 0 {
+        let cap = config.total_capital as f64;
+        if config.total_cost_lot_value > cap * config.max_cost_lot_capital_ratio.clamp(0.05, 1.0) {
+            bump(&mut rejected, "TOO_MUCH_OPEN_COST_BASIS");
+            info!(
+                "[BAF][CAPITAL] Skipping scan — TOO_MUCH_OPEN_COST_BASIS cost_lots {:.0} / cap {:.0}",
+                config.total_cost_lot_value, cap
+            );
+            return Ok(Vec::new());
+        }
+        if config.open_buy_capital > cap * config.max_open_buy_capital_ratio.clamp(0.05, 1.0) {
+            bump(&mut rejected, "TOO_MUCH_OPEN_CAPITAL");
+            info!(
+                "[BAF][CAPITAL] Skipping scan — TOO_MUCH_OPEN_CAPITAL open_buy {:.0} / cap {:.0}",
+                config.open_buy_capital, cap
+            );
+            return Ok(Vec::new());
+        }
+    }
 
     if config.inventory_free_slots <= config.min_free_inventory_slots {
         bump(&mut rejected, "INVENTORY_RISK");
@@ -498,7 +743,23 @@ pub async fn fetch_best_flips(
             config.target_roi_percent,
             config.preferred_volume_value_hour,
         );
-        let score = risk_adjusted_expected_profit_per_hour;
+        let practical = practical_score(&PracticalItemMetrics {
+            expected_net_profit_after_tax: total_profit,
+            expected_cycle_minutes: (60.0 / estimated_cycles_per_hour.max(0.05)).max(1.0),
+            buy_volume: q.buy_volume,
+            sell_volume: q.sell_volume,
+            moving_week,
+            order_count: q.buy_orders.min(q.sell_orders),
+            volume_value_hour,
+            ..Default::default()
+        });
+        let score = practical
+            .score
+            .max(risk_adjusted_expected_profit_per_hour * 0.25);
+        debug!(
+            "[BAF][SCORE] product={} score={:.2} practical={:?}",
+            item_tag, score, practical
+        );
 
         append_snapshot_jsonl(&MarketSnapshot {
             timestamp,
@@ -552,7 +813,7 @@ pub async fn fetch_best_flips(
             estimated_cycles_per_hour,
             allocated_capital,
             expected_profit_per_hour,
-            risk_adjusted_expected_profit_per_hour,
+            risk_adjusted_expected_profit_per_hour: score,
             risk_level,
             risk_notes,
             recommendation,
@@ -916,5 +1177,138 @@ mod tests {
             item_tag_to_name("ENCHANTED_COAL_BLOCK"),
             "Enchanted Coal Block"
         );
+    }
+}
+
+#[cfg(test)]
+mod practical_tests {
+    use super::*;
+
+    fn test_config() -> LocalBazaarScanConfig {
+        LocalBazaarScanConfig {
+            min_profit_per_unit: 5.0,
+            min_total_profit: 15_000.0,
+            min_margin_percent: 1.25,
+            max_margin_percent: 32.0,
+            min_buy_volume: 15_000,
+            min_sell_volume: 25_000,
+            min_order_count: 40,
+            min_moving_week: 1_000_000,
+            max_order_value: 5_000_000,
+            max_amount: 71_680,
+            price_undercut: 0.1,
+            bazaar_tax_rate: 1.25,
+            max_concurrent_orders: 6,
+            target_profit_per_hour: 2_000_000.0,
+            enable_classic_potato_book_flips: true,
+            total_capital: 30_000_000,
+            active_capital_ratio: 0.78,
+            reserve_ratio: 0.22,
+            max_items: 8,
+            max_capital_per_item: 5_000_000,
+            min_roi_percent: 1.0,
+            target_roi_percent: 2.0,
+            min_volume_value_hour: 15_000_000.0,
+            preferred_volume_value_hour: 50_000_000.0,
+            market_participation_rate: 0.12,
+            conservative_market_participation_rate: 0.06,
+            history_window_minutes: 60,
+            inventory_free_slots: 30,
+            min_free_inventory_slots: 10,
+            active_buy_order_count: 0,
+            active_sell_order_count: 0,
+            inventory_sellable_stacks: 0,
+            max_pending_buy_stacks: 6,
+            buy_sell_balance_limit: 1.10,
+            total_cost_lot_value: 0.0,
+            open_buy_capital: 0.0,
+            open_sell_value: 0.0,
+            max_cost_lot_capital_ratio: 0.35,
+            max_open_buy_capital_ratio: 0.35,
+            per_item_exposure_cap: 3_000_000,
+            min_reprice_profit_improvement: 75_000.0,
+            min_reprice_interval_seconds: 240,
+            max_reprices_per_item_per_hour: 3,
+            reprice_cooldown_seconds: 360,
+        }
+    }
+
+    #[test]
+    fn no_theoretical_profit_booking_is_a_tracker_invariant() {
+        let expected_candidate_profit = 500_000.0;
+        let realized_fifo_profit = 0;
+        assert!(expected_candidate_profit > 0.0);
+        assert_eq!(realized_fifo_profit, 0);
+    }
+
+    #[test]
+    fn sell_through_scoring_prefers_realized_profit_per_hour() {
+        let slow_theoretical = practical_score(&PracticalItemMetrics {
+            expected_net_profit_after_tax: 500_000.0,
+            expected_cycle_minutes: 45.0,
+            buy_volume: 25_000,
+            sell_volume: 25_000,
+            moving_week: 1_000_000,
+            order_count: 40,
+            volume_value_hour: 50_000_000.0,
+            avg_sell_fill_seconds: 2700.0,
+            current_cost_lot_value: 2_000_000.0,
+            ..Default::default()
+        });
+        let fast_realized = practical_score(&PracticalItemMetrics {
+            expected_net_profit_after_tax: 150_000.0,
+            expected_cycle_minutes: 5.0,
+            buy_volume: 25_000,
+            sell_volume: 25_000,
+            moving_week: 1_000_000,
+            order_count: 40,
+            volume_value_hour: 50_000_000.0,
+            avg_sell_fill_seconds: 300.0,
+            successful_flips: 3,
+            realized_profit_last_10m: 150_000,
+            ..Default::default()
+        });
+        assert!(fast_realized.score > slow_theoretical.score);
+    }
+
+    #[test]
+    fn cost_lot_pressure_blocks_carrot_zest_stack() {
+        let cfg = test_config();
+        let decision =
+            evaluate_position_limits(0.0, 3_500_000.0, 0.0, 2_000_000.0, 3_500_000.0, 0.0, &cfg);
+        assert_eq!(decision, CandidateDecision::Reject("POSITION_LIMIT"));
+    }
+
+    #[test]
+    fn per_item_exposure_cap_rejects_candidate() {
+        let cfg = test_config();
+        let decision = evaluate_position_limits(
+            2_000_000.0,
+            1_500_000.0,
+            0.0,
+            2_000_000.0,
+            1_500_000.0,
+            0.0,
+            &cfg,
+        );
+        assert_eq!(decision, CandidateDecision::Reject("POSITION_LIMIT"));
+    }
+
+    #[test]
+    fn reprice_throttle_requires_interval_and_profit_improvement() {
+        let cfg = test_config();
+        assert_eq!(
+            should_reprice(60, None, 0, 100_000.0, 300_000.0, false, &cfg).reason,
+            Some("ORDER_TOO_YOUNG")
+        );
+        assert_eq!(
+            should_reprice(300, Some(100), 0, 100_000.0, 300_000.0, false, &cfg).reason,
+            Some("REPRICE_COOLDOWN")
+        );
+        assert_eq!(
+            should_reprice(300, Some(400), 0, 100_000.0, 120_000.0, false, &cfg).reason,
+            Some("LOW_REPRICE_IMPROVEMENT")
+        );
+        assert!(should_reprice(300, Some(400), 0, 100_000.0, 200_000.0, false, &cfg).allowed);
     }
 }

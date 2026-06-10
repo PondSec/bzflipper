@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// File name for persisted orders (stored next to the executable / in the logs dir).
 const ORDERS_FILE: &str = "bazaar_orders.json";
@@ -45,6 +45,71 @@ pub struct BuyCostLotUsage {
     pub price_per_unit: f64,
     pub amount: u64,
     pub total_cost: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SellBlockReason {
+    NegativeExpectedProfit,
+    UnknownCostBasis,
+    InvalidSell,
+}
+
+impl SellBlockReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NegativeExpectedProfit => "NEGATIVE_EXPECTED_PROFIT",
+            Self::UnknownCostBasis => "UNKNOWN_COST_BASIS",
+            Self::InvalidSell => "INVALID_SELL",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SellProfitCheck {
+    pub allowed: bool,
+    pub reason: Option<SellBlockReason>,
+    pub expected_sell_after_tax: f64,
+    pub fifo_cost_basis_total: f64,
+    pub amount: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ItemPerformance {
+    pub item_name: String,
+    pub product_id: String,
+    pub buy_orders_placed: u64,
+    pub buy_orders_filled: u64,
+    pub buy_orders_cancelled: u64,
+    pub sell_orders_placed: u64,
+    pub sell_orders_filled: u64,
+    pub sell_orders_cancelled: u64,
+    pub successful_flips: u64,
+    pub failed_flips: u64,
+    pub realized_profit_total: i64,
+    pub realized_profit_last_10m: i64,
+    pub realized_profit_last_30m: i64,
+    pub realized_profit_last_60m: i64,
+    pub avg_realized_profit_per_flip: f64,
+    pub avg_realized_profit_per_hour: f64,
+    pub avg_buy_fill_seconds: f64,
+    pub avg_sell_fill_seconds: f64,
+    pub avg_total_cycle_seconds: f64,
+    pub avg_hold_seconds: f64,
+    pub current_open_buy_capital: f64,
+    pub current_open_sell_value: f64,
+    pub current_cost_lot_value: f64,
+    pub max_cost_lot_age_seconds: u64,
+    pub reprice_count: u64,
+    pub cancel_count: u64,
+    pub failed_search_count: u64,
+    pub cannot_afford_count: u64,
+    pub unknown_cost_basis_count: u64,
+    pub negative_profit_block_count: u64,
+    pub last_success_timestamp: Option<u64>,
+    pub last_failure_timestamp: Option<u64>,
+    pub cooldown_until: Option<u64>,
+    pub block_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -82,9 +147,20 @@ pub struct BazaarProfitAuditSnapshot {
     pub ignored_legacy_profit_total: i64,
     pub open_buy_capital: f64,
     pub open_sell_value: f64,
+    pub active_buy_orders: usize,
+    pub active_sell_orders: usize,
     pub remaining_cost_lots: HashMap<String, Vec<BuyCostLot>>,
+    pub remaining_cost_lot_value: f64,
+    pub estimated_sell_value_after_tax: f64,
+    pub estimated_unrealized_profit: f64,
+    pub stale_buy_orders: usize,
+    pub stale_sell_orders: usize,
+    pub items_waiting_for_sell: Vec<String>,
+    pub last_sell_audit_at: Option<u64>,
     pub web_graph_source: String,
     pub last_sell_audit: Option<SellProfitAudit>,
+    pub item_performance: HashMap<String, ItemPerformance>,
+    pub cleanup_state: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -93,6 +169,7 @@ struct BazaarProfitAuditState {
     unknown_cost_basis_sell_total_count: u64,
     ignored_legacy_profit_total: i64,
     last_sell_audit: Option<SellProfitAudit>,
+    last_sell_audit_at: Option<u64>,
 }
 
 /// Thread-safe tracker for active bazaar orders.
@@ -108,6 +185,8 @@ pub struct BazaarOrderTracker {
     /// SELL order targets created by the local Hypixel Bazaar scanner.
     /// Maps normalized item name → (target_sell_price_per_unit, item_tag, planned_amount).
     planned_local_sells: Arc<RwLock<HashMap<String, (f64, Option<String>, Option<u64>)>>>,
+    item_performance: Arc<RwLock<HashMap<String, ItemPerformance>>>,
+    end_phase_state: Arc<RwLock<String>>,
 }
 
 impl BazaarOrderTracker {
@@ -118,6 +197,8 @@ impl BazaarOrderTracker {
             bz_list_profits: Arc::new(RwLock::new(HashMap::new())),
             profit_audit: Arc::new(RwLock::new(BazaarProfitAuditState::default())),
             planned_local_sells: Arc::new(RwLock::new(HashMap::new())),
+            item_performance: Arc::new(RwLock::new(HashMap::new())),
+            end_phase_state: Arc::new(RwLock::new("IDLE".to_string())),
         };
         tracker.load_from_disk();
         tracker
@@ -133,6 +214,8 @@ impl BazaarOrderTracker {
             bz_list_profits: Arc::new(RwLock::new(HashMap::new())),
             profit_audit: Arc::new(RwLock::new(BazaarProfitAuditState::default())),
             planned_local_sells: Arc::new(RwLock::new(HashMap::new())),
+            item_performance: Arc::new(RwLock::new(HashMap::new())),
+            end_phase_state: Arc::new(RwLock::new("IDLE".to_string())),
         }
     }
 
@@ -148,6 +231,7 @@ impl BazaarOrderTracker {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let item_for_perf = item_name.clone();
         self.orders.write().push(TrackedBazaarOrder {
             item_name,
             amount,
@@ -155,6 +239,13 @@ impl BazaarOrderTracker {
             is_buy_order,
             status: "open".to_string(),
             placed_at: now,
+        });
+        self.update_performance(&item_for_perf, |p| {
+            if is_buy_order {
+                p.buy_orders_placed += 1;
+            } else {
+                p.sell_orders_placed += 1;
+            }
         });
         self.save_orders_to_disk();
     }
@@ -369,6 +460,145 @@ impl BazaarOrderTracker {
         removed
     }
 
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn update_performance<F>(&self, item_name: &str, f: F)
+    where
+        F: FnOnce(&mut ItemPerformance),
+    {
+        let key = normalize_for_match(item_name);
+        let mut map = self.item_performance.write();
+        let perf = map.entry(key.clone()).or_insert_with(|| ItemPerformance {
+            item_name: item_name.to_string(),
+            product_id: key.clone(),
+            ..Default::default()
+        });
+        if perf.item_name.is_empty() {
+            perf.item_name = item_name.to_string();
+        }
+        f(perf);
+    }
+
+    pub fn set_end_phase_state(&self, state: impl Into<String>) {
+        *self.end_phase_state.write() = state.into();
+    }
+
+    pub fn end_phase_state(&self) -> String {
+        self.end_phase_state.read().clone()
+    }
+
+    pub fn remaining_cost_lot_value_for(&self, item_name: &str) -> f64 {
+        let key = normalize_for_match(item_name);
+        self.buy_cost_lots
+            .read()
+            .get(&key)
+            .map(|lots| {
+                lots.iter()
+                    .map(|lot| lot.price_per_unit * lot.amount as f64)
+                    .sum()
+            })
+            .unwrap_or(0.0)
+    }
+
+    pub fn open_order_value_for(&self, item_name: &str, is_buy_order: bool) -> f64 {
+        let key = normalize_for_match(item_name);
+        self.orders
+            .read()
+            .iter()
+            .filter(|o| {
+                o.is_buy_order == is_buy_order
+                    && (o.status == "open" || o.status == "filled")
+                    && normalize_for_match(&o.item_name) == key
+            })
+            .map(|o| o.price_per_unit * o.amount as f64)
+            .sum()
+    }
+
+    pub fn peek_fifo_cost_basis(&self, item_name: &str, amount: u64) -> Option<f64> {
+        if amount == 0 {
+            return None;
+        }
+        let key = normalize_for_match(item_name);
+        let lots = self.buy_cost_lots.read();
+        let mut remaining = amount;
+        let mut total = 0.0;
+        for lot in lots.get(&key)? {
+            let used = remaining.min(lot.amount);
+            total += lot.price_per_unit * used as f64;
+            remaining -= used;
+            if remaining == 0 {
+                return Some(total);
+            }
+        }
+        None
+    }
+
+    pub fn validate_sell_before_order(
+        &self,
+        item_name: &str,
+        amount: u64,
+        sell_price_per_unit: f64,
+        bazaar_tax_rate: f64,
+    ) -> SellProfitCheck {
+        let tax_multiplier = 1.0 - (bazaar_tax_rate.max(0.0) / 100.0);
+        let expected_sell_after_tax = sell_price_per_unit * amount as f64 * tax_multiplier;
+        if amount == 0 || sell_price_per_unit <= 0.0 {
+            return SellProfitCheck {
+                allowed: false,
+                reason: Some(SellBlockReason::InvalidSell),
+                expected_sell_after_tax,
+                fifo_cost_basis_total: 0.0,
+                amount,
+            };
+        }
+        let Some(cost_basis) = self.peek_fifo_cost_basis(item_name, amount) else {
+            self.update_performance(item_name, |p| {
+                p.unknown_cost_basis_count += 1;
+                p.last_failure_timestamp = Some(Self::now_secs());
+                p.block_reason = Some(SellBlockReason::UnknownCostBasis.as_str().to_string());
+            });
+            return SellProfitCheck {
+                allowed: false,
+                reason: Some(SellBlockReason::UnknownCostBasis),
+                expected_sell_after_tax,
+                fifo_cost_basis_total: 0.0,
+                amount,
+            };
+        };
+        if expected_sell_after_tax <= cost_basis {
+            self.update_performance(item_name, |p| {
+                p.negative_profit_block_count += 1;
+                p.failed_flips += 1;
+                p.last_failure_timestamp = Some(Self::now_secs());
+                p.cooldown_until = Some(Self::now_secs() + 900);
+                p.block_reason = Some(SellBlockReason::NegativeExpectedProfit.as_str().to_string());
+            });
+            info!(
+                "[BAF][SELL_BLOCKED_NEGATIVE] item={} amount={} expected_after_tax={:.1} fifo_cost_basis={:.1} reason=NEGATIVE_EXPECTED_PROFIT",
+                item_name, amount, expected_sell_after_tax, cost_basis
+            );
+            return SellProfitCheck {
+                allowed: false,
+                reason: Some(SellBlockReason::NegativeExpectedProfit),
+                expected_sell_after_tax,
+                fifo_cost_basis_total: cost_basis,
+                amount,
+            };
+        }
+        SellProfitCheck {
+            allowed: true,
+            reason: None,
+            expected_sell_after_tax,
+            fifo_cost_basis_total: cost_basis,
+            amount,
+        }
+    }
+
     /// Record a collected buy order as an individual FIFO cost lot.
     ///
     /// Legacy weighted-average data from `bazaar_buy_costs.json` is not used
@@ -440,6 +670,14 @@ impl BazaarOrderTracker {
             let mut state = self.profit_audit.write();
             state.unknown_cost_basis_sell_total_count += 1;
             state.last_sell_audit = Some(audit.clone());
+            state.last_sell_audit_at = Some(Self::now_secs());
+            drop(state);
+            self.update_performance(item_name, |p| {
+                p.unknown_cost_basis_count += 1;
+                p.failed_flips += 1;
+                p.last_failure_timestamp = Some(Self::now_secs());
+                p.block_reason = audit.reason.clone();
+            });
             return audit;
         }
 
@@ -486,6 +724,26 @@ impl BazaarOrderTracker {
         let mut state = self.profit_audit.write();
         state.current_fifo_realized_profit_total += realized_profit;
         state.last_sell_audit = Some(audit.clone());
+        state.last_sell_audit_at = Some(Self::now_secs());
+        drop(state);
+        self.update_performance(item_name, |p| {
+            p.sell_orders_filled += 1;
+            p.realized_profit_total += realized_profit;
+            if realized_profit > 0 {
+                p.successful_flips += 1;
+                p.last_success_timestamp = Some(Self::now_secs());
+                p.block_reason = None;
+            } else {
+                p.failed_flips += 1;
+                p.last_failure_timestamp = Some(Self::now_secs());
+            }
+            let flips = p.successful_flips.max(1) as f64;
+            p.avg_realized_profit_per_flip = p.realized_profit_total as f64 / flips;
+        });
+        info!(
+            "[BAF][REALIZED_PROFIT] item={} amount={} cost_basis={:.1} claimed_after_tax={:.1} realized_profit={}",
+            item_name, sold_amount, cost_basis_total, claimed_coins_after_tax, realized_profit
+        );
         audit
     }
 
@@ -517,32 +775,104 @@ impl BazaarOrderTracker {
 
     pub fn profit_audit_snapshot(&self) -> BazaarProfitAuditSnapshot {
         let state = self.profit_audit.read().clone();
+        let now = Self::now_secs();
+        let stale_after = 20 * 60;
         let orders = self.orders.read();
-        let open_buy_capital = orders
+        let active_orders: Vec<&TrackedBazaarOrder> = orders
+            .iter()
+            .filter(|o| o.status == "open" || o.status == "filled")
+            .collect();
+        let open_buy_capital: f64 = active_orders
             .iter()
             .filter(|o| o.is_buy_order)
             .map(|o| o.price_per_unit * o.amount as f64)
             .sum();
-        let open_sell_value = orders
+        let open_sell_value: f64 = active_orders
             .iter()
             .filter(|o| !o.is_buy_order)
             .map(|o| o.price_per_unit * o.amount as f64)
             .sum();
-        let remaining_cost_lots = self
-            .buy_cost_lots
-            .read()
+        let active_buy_orders = active_orders.iter().filter(|o| o.is_buy_order).count();
+        let active_sell_orders = active_orders.iter().filter(|o| !o.is_buy_order).count();
+        let stale_buy_orders = active_orders
             .iter()
-            .map(|(item, lots)| (item.clone(), lots.iter().cloned().collect()))
-            .collect();
+            .filter(|o| o.is_buy_order && now.saturating_sub(o.placed_at) >= stale_after)
+            .count();
+        let stale_sell_orders = active_orders
+            .iter()
+            .filter(|o| !o.is_buy_order && now.saturating_sub(o.placed_at) >= stale_after)
+            .count();
+        let tax_multiplier = 1.0 - 0.0125;
+        let estimated_sell_value_after_tax = open_sell_value * tax_multiplier;
+        let lots_guard = self.buy_cost_lots.read();
+        let mut remaining_cost_lots = HashMap::new();
+        let mut remaining_cost_lot_value = 0.0;
+        let mut items_waiting_for_sell = Vec::new();
+        for (item, lots) in lots_guard.iter() {
+            let lot_vec: Vec<BuyCostLot> = lots.iter().cloned().collect();
+            let item_value: f64 = lots
+                .iter()
+                .map(|lot| lot.price_per_unit * lot.amount as f64)
+                .sum();
+            remaining_cost_lot_value += item_value;
+            let has_active_sell = active_orders
+                .iter()
+                .any(|o| !o.is_buy_order && normalize_for_match(&o.item_name) == *item);
+            if item_value > 0.0 && !has_active_sell {
+                items_waiting_for_sell.push(item.clone());
+            }
+            remaining_cost_lots.insert(item.clone(), lot_vec);
+        }
+        let mut item_performance = self.item_performance.read().clone();
+        for perf in item_performance.values_mut() {
+            perf.current_open_buy_capital = active_orders
+                .iter()
+                .filter(|o| {
+                    o.is_buy_order
+                        && normalize_for_match(&o.item_name) == normalize_for_match(&perf.item_name)
+                })
+                .map(|o| o.price_per_unit * o.amount as f64)
+                .sum();
+            perf.current_open_sell_value = active_orders
+                .iter()
+                .filter(|o| {
+                    !o.is_buy_order
+                        && normalize_for_match(&o.item_name) == normalize_for_match(&perf.item_name)
+                })
+                .map(|o| o.price_per_unit * o.amount as f64)
+                .sum();
+            if let Some(lots) = lots_guard.get(&normalize_for_match(&perf.item_name)) {
+                perf.current_cost_lot_value = lots
+                    .iter()
+                    .map(|lot| lot.price_per_unit * lot.amount as f64)
+                    .sum();
+                perf.max_cost_lot_age_seconds = lots
+                    .iter()
+                    .map(|lot| now.saturating_sub(lot.collected_at))
+                    .max()
+                    .unwrap_or(0);
+            }
+        }
         BazaarProfitAuditSnapshot {
             current_fifo_realized_profit_total: state.current_fifo_realized_profit_total,
             unknown_cost_basis_sell_total_count: state.unknown_cost_basis_sell_total_count,
             ignored_legacy_profit_total: state.ignored_legacy_profit_total,
             open_buy_capital,
             open_sell_value,
+            active_buy_orders,
+            active_sell_orders,
             remaining_cost_lots,
+            remaining_cost_lot_value,
+            estimated_sell_value_after_tax,
+            estimated_unrealized_profit: estimated_sell_value_after_tax - remaining_cost_lot_value,
+            stale_buy_orders,
+            stale_sell_orders,
+            items_waiting_for_sell,
+            last_sell_audit_at: state.last_sell_audit_at,
             web_graph_source: "local_fifo_known_cost_basis_only".to_string(),
             last_sell_audit: state.last_sell_audit,
+            item_performance,
+            cleanup_state: self.end_phase_state(),
         }
     }
 
@@ -1182,5 +1512,66 @@ mod tests {
         tracker.set_bz_list_profits(items2);
         assert!(tracker.get_bz_list_profit("Coal").is_none());
         assert_eq!(tracker.get_bz_list_profit("Diamond"), Some(20_000));
+    }
+    #[test]
+    fn fifo_frogcoin_profit_matches_real_claim() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.record_buy_cost("Frogcoin", 367_843.9, 2);
+
+        let audit = tracker.account_sell_collect("Frogcoin", 2, 955_952.3375, Some(967_040.8481));
+
+        assert_eq!(audit.cost_basis_status, CostBasisStatus::Known);
+        assert_eq!(audit.cost_basis_total, 735_687.8);
+        assert_eq!(audit.realized_profit, 220_265);
+    }
+
+    #[test]
+    fn negative_designer_coffee_beans_sell_is_blocked_without_consuming_fifo() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.record_buy_cost("Designer Coffee Beans", 254_005.2, 2);
+
+        let check =
+            tracker.validate_sell_before_order("Designer Coffee Beans", 2, 229_996.900, 1.25);
+
+        assert!(!check.allowed);
+        assert_eq!(check.reason, Some(SellBlockReason::NegativeExpectedProfit));
+        assert!((check.fifo_cost_basis_total - 508_010.4).abs() < 0.01);
+        assert!((check.expected_sell_after_tax - 454_243.8775).abs() < 0.01);
+        let snapshot = tracker.profit_audit_snapshot();
+        assert_eq!(snapshot.current_fifo_realized_profit_total, 0);
+        assert_eq!(
+            snapshot.remaining_cost_lots["designer coffee beans"][0].amount,
+            2
+        );
+        assert_eq!(
+            snapshot.item_performance["designer coffee beans"].negative_profit_block_count,
+            1
+        );
+    }
+
+    #[test]
+    fn api_snapshot_open_sell_value_is_nonzero_for_active_sell_order() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.add_order("Frogcoin".into(), 2, 500_000.0, false);
+
+        let snapshot = tracker.profit_audit_snapshot();
+
+        assert_eq!(snapshot.active_sell_orders, 1);
+        assert!(snapshot.open_sell_value > 0.0);
+    }
+
+    #[test]
+    fn legacy_ignored_total_never_changes_fifo_bz_total() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.record_ignored_legacy_profit(18_984_775, "/cofl bz l");
+
+        let snapshot = tracker.profit_audit_snapshot();
+
+        assert_eq!(snapshot.ignored_legacy_profit_total, 18_984_775);
+        assert_eq!(snapshot.current_fifo_realized_profit_total, 0);
+        assert_eq!(
+            snapshot.web_graph_source,
+            "local_fifo_known_cost_basis_only"
+        );
     }
 }

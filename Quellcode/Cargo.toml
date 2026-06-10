@@ -1,17 +1,17 @@
 [package]
-name = "frikadellen_baf"
+name = "purse_pilot"
 version = "3.0.0"
 edition = "2021"
-authors = ["TreXito"]
-description = "Frikadellen BAF (Bazaar Auction Flipper) for Hypixel Skyblock - Rust port using Azalea"
+authors = ["PondSec"]
+description = "PursePilot (Bazaar Auction Flipper) for Hypixel Skyblock - Rust port using Azalea"
 license = "AGPL-3.0"
 
 [[bin]]
-name = "frikadellen_baf"
+name = "purse_pilot"
 path = "src/main.rs"
 
 [[bin]]
-name = "FrikadellenBAF-loader"
+name = "PursePilot-loader"
 path = "src/loader.rs"
 
 [dependencies]

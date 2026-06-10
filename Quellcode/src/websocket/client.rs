@@ -403,7 +403,7 @@ pub fn parse_license_page_number(messages: &[ChatMessage]) -> u32 {
 ///     `§7> §aIGN_NAME §2TIER`               (active license)
 ///
 ///   **Search results** — global index prefix:
-///     `§7N> §aIGN_NAME §2TIER Xd`           (e.g. `§716> §aTreXitooo §2PREMIUM 29.9d`)
+///     `§7N> §aIGN_NAME §2TIER Xd`           (e.g. `§716> §aPondSecoo §2PREMIUM 29.9d`)
 ///
 /// Returns `(ign, index, tier)` tuples.  For page listings the index is a
 /// 1-based page-local counter; for search results it is the global license
@@ -917,7 +917,7 @@ mod tests {
                 hover: None,
             },
             ChatMessage {
-                text: "§716> §aTreXitooo §2PREMIUM 29.9d".to_string(),
+                text: "§716> §aPondSecoo §2PREMIUM 29.9d".to_string(),
                 on_click: None,
                 hover: None,
             },
@@ -931,7 +931,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries[0],
-            ("TreXitooo".to_string(), 16, "PREMIUM".to_string())
+            ("PondSecoo".to_string(), 16, "PREMIUM".to_string())
         );
     }
 
@@ -941,12 +941,12 @@ mod tests {
         // Search result with multiple entries at different global indices
         let messages = vec![
             ChatMessage {
-                text: "§716> §aTreXitooo §2PREMIUM 29.9d".to_string(),
+                text: "§716> §aPondSecoo §2PREMIUM 29.9d".to_string(),
                 on_click: None,
                 hover: None,
             },
             ChatMessage {
-                text: "§742> §aTreXitooo §2§mNONE§c expired".to_string(),
+                text: "§742> §aPondSecoo §2§mNONE§c expired".to_string(),
                 on_click: None,
                 hover: None,
             },
@@ -955,11 +955,11 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(
             entries[0],
-            ("TreXitooo".to_string(), 16, "PREMIUM".to_string())
+            ("PondSecoo".to_string(), 16, "PREMIUM".to_string())
         );
         assert_eq!(
             entries[1],
-            ("TreXitooo".to_string(), 42, "NONE".to_string())
+            ("PondSecoo".to_string(), 42, "NONE".to_string())
         );
     }
 
