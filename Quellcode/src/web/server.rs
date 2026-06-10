@@ -1,19 +1,19 @@
 use std::collections::HashSet;
 use std::sync::{
-    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
 };
 
 use axum::{
-    Json, Router,
     extract::{
-        Request, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
+        Request, State, WebSocketUpgrade,
     },
     http::StatusCode,
     middleware::Next,
     response::{Html, IntoResponse, Response},
     routing::get,
+    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -313,10 +313,6 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         )
         .route("/api/auctions", get(get_auctions))
         .route("/api/bazaar_orders", get(get_bazaar_orders))
-        .route(
-            "/api/bazaar_item_performance",
-            get(get_bazaar_item_performance),
-        )
         .route("/api/queue", get(get_queue_status))
         .route("/api/config", get(get_config).post(save_config))
         .route("/api/logs/latest", get(download_latest_log))
@@ -1334,12 +1330,6 @@ async fn get_bazaar_orders(
     State(s): State<WebSharedState>,
 ) -> Json<Vec<crate::bazaar_tracker::TrackedBazaarOrder>> {
     Json(s.bazaar_tracker.get_orders())
-}
-
-async fn get_bazaar_item_performance(
-    State(s): State<WebSharedState>,
-) -> Json<crate::bazaar_tracker::BazaarItemPerformanceSnapshot> {
-    Json(s.bazaar_tracker.item_performance_snapshot())
 }
 
 // ── Queue status endpoint ───────────────────────────────────
