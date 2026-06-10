@@ -7,19 +7,19 @@ use frikadellen_baf::{
     logging::{init_logger, print_mc_chat},
     state::CommandQueue,
     types::Flip,
-    web::{start_web_server, WebSharedState},
+    web::{WebSharedState, start_web_server},
     websocket::CoflWebSocket,
 };
 use rustyline;
 use serde_json;
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Instant;
 use tokio::sync::broadcast;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
 const VERSION: &str = "af-3.0";
@@ -232,7 +232,9 @@ fn check_ufw_port(port: u16) {
         .any(|token| token == port_str || token == port_tcp || token == port_udp);
     if !allowed {
         warn!("========================================");
-        warn!("! WARNING: YOU HAVE SET A PORT FOR THE WEB APP BUT THE PORT ISN'T ALLOWED ON YOUR FIREWALL");
+        warn!(
+            "! WARNING: YOU HAVE SET A PORT FOR THE WEB APP BUT THE PORT ISN'T ALLOWED ON YOUR FIREWALL"
+        );
         warn!("! PLEASE EXECUTE THE FOLLOWING COMMAND TO ACCESS IT VIA THE INTERNET:");
         warn!("!   ufw allow {}", port);
         warn!("========================================");
@@ -1100,7 +1102,9 @@ async fn main() -> Result<()> {
 
                     // Detect bazaar daily sell value limit
                     if clean.contains("You reached the daily limit") && clean.contains("bazaar") {
-                        warn!("[Bazaar] Daily sell value limit reached — disabling bazaar flips until 0:00 UTC");
+                        warn!(
+                            "[Bazaar] Daily sell value limit reached — disabling bazaar flips until 0:00 UTC"
+                        );
                         // Send webhook notification
                         if let Some(webhook_url) = config_for_events.active_bazaar_webhook_url() {
                             let url = webhook_url.to_string();
@@ -1178,7 +1182,9 @@ async fn main() -> Result<()> {
                                         .unwrap_or(false);
 
                                 if !is_bazaar_orders {
-                                    tracing::debug!("[UploadBazaarOrders] Skipping upload — window changed from Bazaar Orders");
+                                    tracing::debug!(
+                                        "[UploadBazaarOrders] Skipping upload — window changed from Bazaar Orders"
+                                    );
                                     return;
                                 }
 
@@ -1188,7 +1194,10 @@ async fn main() -> Result<()> {
                                 })
                                 .to_string();
                                 if let Err(e) = ws_upload.send_message(&msg).await {
-                                    tracing::warn!("[UploadBazaarOrders] Failed to send bazaar window data: {}", e);
+                                    tracing::warn!(
+                                        "[UploadBazaarOrders] Failed to send bazaar window data: {}",
+                                        e
+                                    );
                                 } else {
                                     tracing::info!(
                                         "[UploadBazaarOrders] Sent bazaar window data to COFL"
@@ -1243,7 +1252,10 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
                 frikadellen_baf::bot::BotEvent::StartupComplete { orders_cancelled } => {
-                    info!("[Startup] Startup complete - bot is ready to flip! ({} order(s) cancelled)", orders_cancelled);
+                    info!(
+                        "[Startup] Startup complete - bot is ready to flip! ({} order(s) cancelled)",
+                        orders_cancelled
+                    );
                     // Clear the bazaar order tracker for a clean slate — the startup
                     // ManageOrders cycle cancelled all in-game orders already.
                     {
@@ -1362,7 +1374,9 @@ async fn main() -> Result<()> {
                     // purchases run before we open the AH windows to collect.
                     // Skip claiming when inventory is near full to keep space for selling.
                     if bot_client_clone.is_inventory_near_full() {
-                        warn!("[ItemPurchased] Skipping claim — inventory near full, prioritizing selling");
+                        warn!(
+                            "[ItemPurchased] Skipping claim — inventory near full, prioritizing selling"
+                        );
                         let baf_msg = "§f[§4BAF§f]: §e⚠ Inventory near full — skipping claim to keep space for selling".to_string();
                         print_mc_chat(&baf_msg);
                         let _ = chat_tx_events.send(baf_msg);
@@ -1658,9 +1672,14 @@ async fn main() -> Result<()> {
                             })
                             .to_string();
                             if let Err(e) = ws_si.send_message(&msg).await {
-                                tracing::warn!("[SellInventory] Failed to auto-request sellinventory after auction sale: {}", e);
+                                tracing::warn!(
+                                    "[SellInventory] Failed to auto-request sellinventory after auction sale: {}",
+                                    e
+                                );
                             } else {
-                                tracing::info!("[SellInventory] Auto-requested sellinventory after auction sale");
+                                tracing::info!(
+                                    "[SellInventory] Auto-requested sellinventory after auction sale"
+                                );
                             }
                         });
                     }
@@ -1818,7 +1837,7 @@ async fn main() -> Result<()> {
                                 item_name, actual_amount, order.price_per_unit
                             );
                             if actual_amount > 0 {
-                                if let Some((sell_price_per_unit, _item_tag)) =
+                                if let Some((sell_price_per_unit, planned_item_tag)) =
                                     bazaar_tracker_events.take_planned_local_sell(&item_name)
                                 {
                                     if bot_client_clone.is_bazaar_daily_limit() {
@@ -1827,6 +1846,34 @@ async fn main() -> Result<()> {
                                             item_name
                                         );
                                     } else {
+                                        let sell_safety = bazaar_tracker_events
+                                            .evaluate_sell_safety(
+                                                &item_name,
+                                                actual_amount,
+                                                sell_price_per_unit,
+                                                config_for_events.bazaar_tax_rate,
+                                            );
+                                        if !sell_safety.allowed {
+                                            let reason = sell_safety
+                                                .reason
+                                                .as_deref()
+                                                .unwrap_or("BLOCKED_NEGATIVE_EXPECTED_PROFIT");
+                                            warn!(
+                                                "[BazaarProfitAudit] blocked SELL item_name={} amount={} sell_price_per_unit={:.1} expected_sell_after_tax={:.0} fifo_cost_basis_total={:.0} expected_loss={:.0} reason={}",
+                                                item_name,
+                                                actual_amount,
+                                                sell_price_per_unit,
+                                                sell_safety.expected_sell_after_tax,
+                                                sell_safety.fifo_cost_basis_total,
+                                                (sell_safety.fifo_cost_basis_total
+                                                    - sell_safety.expected_sell_after_tax)
+                                                    .max(0.0),
+                                                reason
+                                            );
+                                            bazaar_tracker_events
+                                                .record_failure(&item_name, None, reason, 3600);
+                                            continue;
+                                        }
                                         info!(
                                             "[LocalBazaar] BUY collected for {} — queueing SELL {}x @ {:.1}",
                                             item_name, actual_amount, sell_price_per_unit
@@ -1842,13 +1889,13 @@ async fn main() -> Result<()> {
                                         bazaar_tracker_events.record_planned_local_sell_amount(
                                             &item_name,
                                             sell_price_per_unit,
-                                            None,
+                                            planned_item_tag.clone(),
                                             actual_amount,
                                         );
                                         command_queue_clone.enqueue(
                                             frikadellen_baf::types::CommandType::BazaarSellOrder {
                                                 item_name: item_name.clone(),
-                                                item_tag: None,
+                                                item_tag: planned_item_tag,
                                                 amount: actual_amount,
                                                 price_per_unit: sell_price_per_unit,
                                             },
@@ -1860,8 +1907,11 @@ async fn main() -> Result<()> {
                             }
                         }
                     } else {
-                        debug!("[BazaarProfit] No tracked order for collected {} {} (may be from a previous session)",
-                            if is_buy_order { "BUY" } else { "SELL" }, item_name);
+                        debug!(
+                            "[BazaarProfit] No tracked order for collected {} {} (may be from a previous session)",
+                            if is_buy_order { "BUY" } else { "SELL" },
+                            item_name
+                        );
                     }
                     // Compute realized Bazaar profit strictly from local FIFO lots.
                     // UNKNOWN_COST_BASIS sells are audited but never counted in the graph.
@@ -1894,6 +1944,12 @@ async fn main() -> Result<()> {
                                 frikadellen_baf::bazaar_tracker::CostBasisStatus::Known
                             ) {
                                 profit_tracker_events.record_bz_profit(audit.realized_profit);
+                                bazaar_tracker_events.record_successful_flip(
+                                    &item_name,
+                                    None,
+                                    audit.realized_profit,
+                                    0.0,
+                                );
                                 Some(audit.realized_profit)
                             } else {
                                 None
@@ -1912,7 +1968,10 @@ async fn main() -> Result<()> {
                                 audit.lots_used,
                                 audit.cost_basis_total,
                                 audit.cost_basis_status.as_str(),
-                                audit.reason.as_deref().unwrap_or("missing_tracked_sell_order")
+                                audit
+                                    .reason
+                                    .as_deref()
+                                    .unwrap_or("missing_tracked_sell_order")
                             );
                             None
                         }
@@ -2032,9 +2091,14 @@ async fn main() -> Result<()> {
                                 })
                                 .to_string();
                                 if let Err(e) = ws_bz_h.send_message(&message).await {
-                                    tracing::warn!("[CoflBzH] Failed to send /cofl bz h after SELL collect: {}", e);
+                                    tracing::warn!(
+                                        "[CoflBzH] Failed to send /cofl bz h after SELL collect: {}",
+                                        e
+                                    );
                                 } else {
-                                    tracing::info!("[CoflBzH] Auto-requested /cofl bz h after SELL order collected");
+                                    tracing::info!(
+                                        "[CoflBzH] Auto-requested /cofl bz h after SELL order collected"
+                                    );
                                 }
                             }
                         });
@@ -2177,9 +2241,14 @@ async fn main() -> Result<()> {
                     // SELL fills are always collected (they yield coins, not items).
                     if enable_bazaar_flips_events.load(Ordering::Relaxed) {
                         if is_buy_order && bot_client_clone.is_inventory_full() {
-                            info!("[BazaarOrders] BUY order filled but inventory full — deferring ManageOrders for \"{}\"", item_name);
+                            info!(
+                                "[BazaarOrders] BUY order filled but inventory full — deferring ManageOrders for \"{}\"",
+                                item_name
+                            );
                         } else if command_queue_clone.has_manage_orders() {
-                            info!("[BazaarOrders] Order filled — ManageOrders already queued/running, skipping duplicate");
+                            info!(
+                                "[BazaarOrders] Order filled — ManageOrders already queued/running, skipping duplicate"
+                            );
                         } else {
                             info!("[BazaarOrders] Order filled — queuing ManageOrders");
                             command_queue_clone.enqueue(
@@ -2198,7 +2267,10 @@ async fn main() -> Result<()> {
                     // in the Bazaar Orders window so the web GUI stays in sync.
                     let removed = bazaar_tracker_events.reconcile_with_ingame(&ingame_orders);
                     if removed > 0 {
-                        info!("[BazaarOrders] Reconciled tracker: removed {} stale entries not found in-game", removed);
+                        info!(
+                            "[BazaarOrders] Reconciled tracker: removed {} stale entries not found in-game",
+                            removed
+                        );
                     }
                 }
             }
@@ -2432,7 +2504,10 @@ async fn main() -> Result<()> {
                         // Keep at least 2 slots free for AH/sell operations.
                         let max_buy = empty.saturating_sub(2);
                         if max_buy == 0 {
-                            debug!("Skipping unstackable BUY — not enough inventory space ({} empty): {}", empty, bazaar_flip.item_name);
+                            debug!(
+                                "Skipping unstackable BUY — not enough inventory space ({} empty): {}",
+                                empty, bazaar_flip.item_name
+                            );
                             continue;
                         }
                         let capped = bazaar_flip.amount.min(max_buy);
@@ -2502,7 +2577,9 @@ async fn main() -> Result<()> {
                         && !effective_is_buy
                         && !command_queue_clone.has_manage_orders()
                     {
-                        info!("[BazaarFlips] At order limit with SELL queued — pre-queuing ManageOrders to free a slot");
+                        info!(
+                            "[BazaarFlips] At order limit with SELL queued — pre-queuing ManageOrders to free a slot"
+                        );
                         command_queue_clone.enqueue(
                             CommandType::ManageOrders {
                                 cancel_open: false,
@@ -2581,7 +2658,10 @@ async fn main() -> Result<()> {
                             license_default_sent_ws.store(true, Ordering::Relaxed);
                             let ws = ws_client_clone.clone();
                             let ign = ingame_name_ws.clone();
-                            info!("[LicenseDefault] No license detected — sending /cofl license default {}", ign);
+                            info!(
+                                "[LicenseDefault] No license detected — sending /cofl license default {}",
+                                ign
+                            );
                             let baf_msg = format!(
                                 "§f[§4BAF§f]: §eNo license for §b{}§e — setting as default account...",
                                 ign
@@ -2653,7 +2733,11 @@ async fn main() -> Result<()> {
                                             // but never overwrite the FIFO-only web graph.
                                             tracker
                                                 .record_ignored_legacy_profit(total, "/cofl bz l");
-                                            tracing::info!("[BZList] Ignored /cofl bz l total for graph (FIFO-only): {} coins ({} flips)", total, count);
+                                            tracing::info!(
+                                                "[BZList] Ignored /cofl bz l total for graph (FIFO-only): {} coins ({} flips)",
+                                                total,
+                                                count
+                                            );
                                             let (color, sign) = if total >= 0 {
                                                 ("§a", "+")
                                             } else {
@@ -2661,7 +2745,10 @@ async fn main() -> Result<()> {
                                             };
                                             let summary = format!(
                                                 "§f[§4BAF§f]: §6[BZ List] §7{} flips, total profit: {}{}{}",
-                                                count, color, sign, format_coins(total)
+                                                count,
+                                                color,
+                                                sign,
+                                                format_coins(total)
                                             );
                                             print_mc_chat(&summary);
                                             let _ = tx.send(summary);
@@ -2709,7 +2796,10 @@ async fn main() -> Result<()> {
                                         rec.item_name
                                     );
                                 } else if bot_client_for_ws.is_bazaar_daily_limit() {
-                                    debug!("Skipping bazaar flip from chat — daily sell value limit reached: {}", rec.item_name);
+                                    debug!(
+                                        "Skipping bazaar flip from chat — daily sell value limit reached: {}",
+                                        rec.item_name
+                                    );
                                 } else if effective_is_buy && bot_client_for_ws.is_inventory_full()
                                 {
                                     debug!(
@@ -2718,7 +2808,10 @@ async fn main() -> Result<()> {
                                     );
                                 } else if effective_is_buy && bazaar_tracker_ws.has_filled_orders()
                                 {
-                                    debug!("Skipping BUY bazaar flip from chat — filled orders pending: {}", rec.item_name);
+                                    debug!(
+                                        "Skipping BUY bazaar flip from chat — filled orders pending: {}",
+                                        rec.item_name
+                                    );
                                 } else {
                                     // Cap BUY amounts for unstackable items (e.g. Enchanted Books)
                                     let order_amount = if effective_is_buy
@@ -2729,15 +2822,18 @@ async fn main() -> Result<()> {
                                         let empty = bot_client_for_ws.empty_slot_count() as u64;
                                         let max_buy = empty.saturating_sub(2);
                                         if max_buy == 0 {
-                                            debug!("Skipping unstackable BUY from chat — not enough space ({} empty): {}", empty, rec.item_name);
+                                            debug!(
+                                                "Skipping unstackable BUY from chat — not enough space ({} empty): {}",
+                                                empty, rec.item_name
+                                            );
                                             continue;
                                         }
                                         let capped = rec.amount.min(max_buy);
                                         if capped < rec.amount {
                                             info!(
-                                            "[BazaarFlips] Capping unstackable BUY amount {} → {} (chat): {}",
-                                            rec.amount, capped, rec.item_name
-                                        );
+                                                "[BazaarFlips] Capping unstackable BUY amount {} → {} (chat): {}",
+                                                rec.amount, capped, rec.item_name
+                                            );
                                         }
                                         capped
                                     } else {
@@ -2750,12 +2846,13 @@ async fn main() -> Result<()> {
                                         ("§c", "SELL")
                                     };
                                     let baf_msg = format!(
-                                    "§f[§4BAF§f]: §6[BZ] {}{}§7 order: §r{}§r §7x{} @ §6{}§7 coins/unit",
-                                    order_color, order_label,
-                                    rec.item_name,
-                                    order_amount,
-                                    format_coins_f64(rec.price_per_unit)
-                                );
+                                        "§f[§4BAF§f]: §6[BZ] {}{}§7 order: §r{}§r §7x{} @ §6{}§7 coins/unit",
+                                        order_color,
+                                        order_label,
+                                        rec.item_name,
+                                        order_amount,
+                                        format_coins_f64(rec.price_per_unit)
+                                    );
                                     print_mc_chat(&baf_msg);
                                     let _ = chat_tx_ws.send(baf_msg);
 
@@ -2780,8 +2877,10 @@ async fn main() -> Result<()> {
                                         }
                                     };
                                     command_queue_clone.enqueue(command_type, priority, true);
-                                    info!("[BazaarFlips] Queued {} order from chat message: {} x{} @ {:.0}",
-                                    order_label, rec.item_name, rec.amount, rec.price_per_unit);
+                                    info!(
+                                        "[BazaarFlips] Queued {} order from chat message: {} x{} @ {:.0}",
+                                        order_label, rec.item_name, rec.amount, rec.price_per_unit
+                                    );
 
                                     // When at the bazaar order limit and we just queued a SELL
                                     // order, pre-queue a ManageOrders run to free a slot.
@@ -2789,7 +2888,9 @@ async fn main() -> Result<()> {
                                         && !effective_is_buy
                                         && !command_queue_clone.has_manage_orders()
                                     {
-                                        info!("[BazaarFlips] At order limit with SELL queued (chat) — pre-queuing ManageOrders to free a slot");
+                                        info!(
+                                            "[BazaarFlips] At order limit with SELL queued (chat) — pre-queuing ManageOrders to free a slot"
+                                        );
                                         command_queue_clone.enqueue(
                                             CommandType::ManageOrders {
                                                 cancel_open: false,
@@ -2837,17 +2938,25 @@ async fn main() -> Result<()> {
                                 // has fresh data before processing the sell command.
                                 if is_sellinventory {
                                     if let Some(inv_json) = inv_client.get_cached_inventory_json() {
-                                        info!("[Inventory] sellinventory: uploading inventory first ({} bytes)", inv_json.len());
+                                        info!(
+                                            "[Inventory] sellinventory: uploading inventory first ({} bytes)",
+                                            inv_json.len()
+                                        );
                                         let upload_msg = serde_json::json!({
                                             "type": "uploadInventory",
                                             "data": inv_json
                                         })
                                         .to_string();
                                         if let Err(e) = ws.send_message(&upload_msg).await {
-                                            error!("[Inventory] sellinventory: failed to pre-upload inventory: {}", e);
+                                            error!(
+                                                "[Inventory] sellinventory: failed to pre-upload inventory: {}",
+                                                e
+                                            );
                                         }
                                     } else {
-                                        warn!("[Inventory] sellinventory: no cached inventory to upload");
+                                        warn!(
+                                            "[Inventory] sellinventory: no cached inventory to upload"
+                                        );
                                     }
                                 }
 
@@ -2974,9 +3083,15 @@ async fn main() -> Result<()> {
 
                             if item_raw.is_none() {
                                 if let Some(ref resolved) = item_raw_resolved {
-                                    info!("[createAuction] Resolved null itemName from inventory slot {:?}: {}", item_slot, resolved);
+                                    info!(
+                                        "[createAuction] Resolved null itemName from inventory slot {:?}: {}",
+                                        item_slot, resolved
+                                    );
                                 } else {
-                                    warn!("[createAuction] itemName is null and could not be resolved from inventory slot {:?}", item_slot);
+                                    warn!(
+                                        "[createAuction] itemName is null and could not be resolved from inventory slot {:?}",
+                                        item_slot
+                                    );
                                 }
                             }
 
@@ -3007,11 +3122,18 @@ async fn main() -> Result<()> {
                                                             - ah_fee as i64;
                                                         if expected_profit < 0 {
                                                             let loss_amount = expected_profit.abs();
-                                                            warn!("[createAuction] Skipping originally-unprofitable flip: {} — target {} - buy {} - fee {} = {} coins",
-                                                                item_name, target, buy_price, ah_fee, expected_profit);
+                                                            warn!(
+                                                                "[createAuction] Skipping originally-unprofitable flip: {} — target {} - buy {} - fee {} = {} coins",
+                                                                item_name,
+                                                                target,
+                                                                buy_price,
+                                                                ah_fee,
+                                                                expected_profit
+                                                            );
                                                             let baf_msg = format!(
                                                                 "§f[§4BAF§f]: §c❌ Skipping AH listing: §r{}§r §7— original flip would lose §c{}§7 coins",
-                                                                item_name, format_coins(loss_amount)
+                                                                item_name,
+                                                                format_coins(loss_amount)
                                                             );
                                                             print_mc_chat(&baf_msg);
                                                             let _ = chat_tx_ws.send(baf_msg);
@@ -3046,7 +3168,9 @@ async fn main() -> Result<()> {
                                     // listing until the window ends so the listing flow does not
                                     // race with ongoing AH purchases.
                                     if bazaar_flips_paused_ws.load(Ordering::Relaxed) {
-                                        info!("[createAuction] AH flip window active — deferring listing until bazaar flips resume");
+                                        info!(
+                                            "[createAuction] AH flip window active — deferring listing until bazaar flips resume"
+                                        );
                                         let flag = bazaar_flips_paused_ws.clone();
                                         let queue = command_queue_clone.clone();
                                         tokio::spawn(async move {
@@ -3060,7 +3184,9 @@ async fn main() -> Result<()> {
                                                     break;
                                                 }
                                             }
-                                            info!("[createAuction] Deferral complete — enqueueing SellToAuction");
+                                            info!(
+                                                "[createAuction] Deferral complete — enqueueing SellToAuction"
+                                            );
                                             queue.enqueue(cmd, CommandPriority::High, false);
                                         });
                                     } else {
@@ -3072,7 +3198,10 @@ async fn main() -> Result<()> {
                                     }
                                 }
                                 _ => {
-                                    warn!("createAuction missing required fields (itemName, price, duration): {}", data);
+                                    warn!(
+                                        "createAuction missing required fields (itemName, price, duration): {}",
+                                        data
+                                    );
                                 }
                             }
                         }
@@ -3142,7 +3271,9 @@ async fn main() -> Result<()> {
                             // Queue a ManageOrders run to handle any deferred order
                             // management (filled orders that need collecting, etc.).
                             if !command_queue_resume.has_manage_orders() {
-                                info!("[BazaarFlips] Queuing deferred ManageOrders after AH flip window");
+                                info!(
+                                    "[BazaarFlips] Queuing deferred ManageOrders after AH flip window"
+                                );
                                 command_queue_resume.enqueue(
                                     CommandType::ManageOrders {
                                         cancel_open: false,
@@ -3193,7 +3324,10 @@ async fn main() -> Result<()> {
                         .iter()
                         .find(|(name, _, _)| name.eq_ignore_ascii_case(current_ign))
                     {
-                        info!("[LicenseDetect] Found '{}' but only has NONE licenses — no transfer needed", found_ign);
+                        info!(
+                            "[LicenseDetect] Found '{}' but only has NONE licenses — no transfer needed",
+                            found_ign
+                        );
                     } else {
                         // No active license found for any configured IGN — set the
                         // default account so the user's subscription tier is applied.
@@ -3202,7 +3336,10 @@ async fn main() -> Result<()> {
                             let ws = ws_client_clone.clone();
                             let ign = ingame_name_ws.clone();
                             let chat_tx = chat_tx_ws.clone();
-                            info!("[LicenseDetect] No active license for any configured IGN — sending /cofl license default {}", ign);
+                            info!(
+                                "[LicenseDetect] No active license for any configured IGN — sending /cofl license default {}",
+                                ign
+                            );
                             let baf_msg = format!(
                                 "§f[§4BAF§f]: §eNo license found — setting §b{}§e as default account...",
                                 ign
@@ -3215,7 +3352,9 @@ async fn main() -> Result<()> {
                                 }
                             });
                         } else {
-                            info!("[LicenseDetect] No license entries matched but license already handled");
+                            info!(
+                                "[LicenseDetect] No license entries matched but license already handled"
+                            );
                         }
                     }
                 }
@@ -3290,7 +3429,9 @@ async fn main() -> Result<()> {
                         cmd.command_type,
                         frikadellen_baf::types::CommandType::ManageOrders { .. }
                     ) {
-                        info!("[Queue] Deferring ManageOrders — AH flip window active, will re-queue on resume");
+                        info!(
+                            "[Queue] Deferring ManageOrders — AH flip window active, will re-queue on resume"
+                        );
                         let baf_msg = "§f[§4BAF§f]: §e⏸ Order management deferred — AH flips incoming, will resume after".to_string();
                         print_mc_chat(&baf_msg);
                         let _ = chat_tx_proc.send(baf_msg);
@@ -3370,7 +3511,9 @@ async fn main() -> Result<()> {
                                         e
                                     );
                                 } else {
-                                    tracing::info!("[SellingMode] Auto-requested sellinventory (inventory full)");
+                                    tracing::info!(
+                                        "[SellingMode] Auto-requested sellinventory (inventory full)"
+                                    );
                                 }
                             });
                         }
@@ -3402,7 +3545,9 @@ async fn main() -> Result<()> {
                     frikadellen_baf::types::CommandType::ClaimPurchasedItem
                 ) && bot_client_clone.is_inventory_near_full()
                 {
-                    debug!("[Queue] Deferring ClaimPurchasedItem — inventory near full, prioritizing selling");
+                    debug!(
+                        "[Queue] Deferring ClaimPurchasedItem — inventory near full, prioritizing selling"
+                    );
                     command_queue_processor.complete_current();
                     sleep(Duration::from_millis(50)).await;
                     continue;
@@ -3484,8 +3629,10 @@ async fn main() -> Result<()> {
                             if next.priority < cmd.priority {
                                 warn!(
                                     "[Queue] Interrupting {:?} ({:?}) for higher-priority {:?} ({:?})",
-                                    cmd.command_type, cmd.priority,
-                                    next.command_type, next.priority,
+                                    cmd.command_type,
+                                    cmd.priority,
+                                    next.command_type,
+                                    next.priority,
                                 );
                                 bot_client_clone.set_state(BotState::Idle);
                                 interrupted = true;
@@ -3751,7 +3898,9 @@ async fn main() -> Result<()> {
                 // appears filled — the ManageOrders handler will close
                 // immediately if it finds nothing actionable.
                 if !bazaar_tracker_orders.has_filled_orders() && cancel_minutes_per_million == 0 {
-                    debug!("[BazaarOrders] No filled orders in tracker — skipping periodic ManageOrders");
+                    debug!(
+                        "[BazaarOrders] No filled orders in tracker — skipping periodic ManageOrders"
+                    );
                     continue;
                 }
                 // When inventory is full, ManageOrders can't collect buy orders
@@ -3807,6 +3956,12 @@ async fn main() -> Result<()> {
         let local_scan_interval = config.local_bazaar_scan_interval_seconds.max(30);
         let local_max_concurrent = config.local_bazaar_max_concurrent_orders.max(1);
         let local_purse_reserve_percent = config.purse_reserve_percent.clamp(0.0, 95.0);
+        let local_min_reprice_profit_improvement =
+            config.local_bazaar_min_reprice_profit_improvement;
+        let local_min_reprice_interval_seconds = config.local_bazaar_min_reprice_interval_seconds;
+        let local_max_reprices_per_item_per_hour =
+            config.local_bazaar_max_reprices_per_item_per_hour;
+        let local_reprice_cooldown_seconds = config.local_bazaar_reprice_cooldown_seconds;
         let local_scan_config = frikadellen_baf::bazaar_scanner::LocalBazaarScanConfig {
             min_profit_per_unit: config.local_bazaar_min_profit_per_unit,
             min_total_profit: config
@@ -3911,7 +4066,10 @@ async fn main() -> Result<()> {
                 {
                     Ok(quotes) => quotes,
                     Err(e) => {
-                        warn!("[LocalBazaar] Failed to fetch Bazaar quotes for inventory sell scan: {}", e);
+                        warn!(
+                            "[LocalBazaar] Failed to fetch Bazaar quotes for inventory sell scan: {}",
+                            e
+                        );
                         sleep(Duration::from_secs(20)).await;
                         continue;
                     }
@@ -3941,6 +4099,27 @@ async fn main() -> Result<()> {
                         let sell_price =
                             (quote.buy_price - local_scan_config.price_undercut.max(0.0)).max(0.0);
                         if amount == 0 || sell_price <= 0.0 {
+                            continue;
+                        }
+                        let sell_safety = bazaar_tracker_local_bz.evaluate_sell_safety(
+                            &item_name,
+                            amount,
+                            sell_price,
+                            local_scan_config.bazaar_tax_rate,
+                        );
+                        if !sell_safety.allowed {
+                            warn!(
+                                "[BazaarProfitAudit] blocked inventory SELL item_name={} amount={} sell_price_per_unit={:.1} expected_sell_after_tax={:.0} fifo_cost_basis_total={:.0} reason={}",
+                                item_name,
+                                amount,
+                                sell_price,
+                                sell_safety.expected_sell_after_tax,
+                                sell_safety.fifo_cost_basis_total,
+                                sell_safety
+                                    .reason
+                                    .as_deref()
+                                    .unwrap_or("UNKNOWN_COST_BASIS")
+                            );
                             continue;
                         }
 
@@ -4026,7 +4205,9 @@ async fn main() -> Result<()> {
                     || bot_client_local_bz.is_inventory_full()
                     || bazaar_tracker_local_bz.has_filled_orders()
                 {
-                    debug!("[LocalBazaar] Skipping BUY scan — limit, inventory, or filled orders need handling first");
+                    debug!(
+                        "[LocalBazaar] Skipping BUY scan — limit, inventory, or filled orders need handling first"
+                    );
                     sleep(Duration::from_secs(20)).await;
                     continue;
                 }
@@ -4059,7 +4240,10 @@ async fn main() -> Result<()> {
                 if active_buy_count > allowed_buy_pressure {
                     debug!(
                         "[LocalBazaar] Holding BUY scan — buy/sell balance active BUYs {} > allowed {} (active SELLs {}, inventory sellables {})",
-                        active_buy_count, allowed_buy_pressure, active_sell_count, inventory_sellable_stacks
+                        active_buy_count,
+                        allowed_buy_pressure,
+                        active_sell_count,
+                        inventory_sellable_stacks
                     );
                     sleep(Duration::from_secs(20)).await;
                     continue;
@@ -4169,6 +4353,81 @@ async fn main() -> Result<()> {
                     let normalized =
                         frikadellen_baf::bazaar_tracker::normalize_for_match_pub(&flip.item_name);
                     if active_items.contains(&normalized) {
+                        info!(
+                            "[LocalBazaarAudit] rejected item_name={} product_id={} reason_rejected=ITEM_ALREADY_ACTIVE expected_profit={:.0} expected_roi={:.2}",
+                            flip.item_name,
+                            flip.product_id,
+                            flip.total_profit,
+                            flip.roi_after_tax * 100.0
+                        );
+                        continue;
+                    }
+                    if let Some(reason) = bazaar_tracker_local_bz
+                        .is_item_blocked(&flip.item_name, Some(&flip.product_id))
+                    {
+                        info!(
+                            "[LocalBazaarAudit] rejected item_name={} product_id={} reason_rejected={} expected_profit={:.0} expected_roi={:.2} cooldown_until=active",
+                            flip.item_name,
+                            flip.product_id,
+                            reason,
+                            flip.total_profit,
+                            flip.roi_after_tax * 100.0
+                        );
+                        continue;
+                    }
+                    let open_item_capital: f64 = active_orders
+                        .iter()
+                        .filter(|o| {
+                            frikadellen_baf::bazaar_tracker::normalize_for_match_pub(&o.item_name)
+                                == normalized
+                        })
+                        .map(|o| o.price_per_unit * o.amount as f64)
+                        .sum();
+                    let allowed_active_capital = (scan_config_for_budget.total_capital as f64
+                        * scan_config_for_budget.active_capital_ratio.clamp(0.05, 1.0))
+                    .max(0.0);
+                    let buy_safety = frikadellen_baf::bazaar_tracker::evaluate_buy_safety(
+                        flip.sell_price_per_unit,
+                        flip.buy_price_per_unit,
+                        flip.amount,
+                        scan_config_for_budget.bazaar_tax_rate,
+                        scan_config_for_budget.min_roi_percent,
+                        open_item_capital,
+                        scan_config_for_budget.max_capital_per_item as f64,
+                        capital_in_buy_orders,
+                        allowed_active_capital,
+                        bot_client_local_bz.get_purse().unwrap_or(0),
+                        reserved_purse,
+                    );
+                    if !buy_safety.allowed {
+                        let reason = buy_safety
+                            .reason
+                            .as_deref()
+                            .unwrap_or("BUY_SAFETY_REJECTED");
+                        info!(
+                            "[LocalBazaarAudit] rejected item_name={} product_id={} reason_rejected={} expected_profit={:.0} expected_roi={:.2} failed_search_count=0 cooldown_until=none",
+                            flip.item_name,
+                            flip.product_id,
+                            reason,
+                            buy_safety.expected_profit,
+                            buy_safety.expected_roi_percent
+                        );
+                        if reason == "BLOCKED_NEGATIVE_EXPECTED_PROFIT" {
+                            bazaar_tracker_local_bz.record_failure(
+                                &flip.item_name,
+                                Some(&flip.product_id),
+                                reason,
+                                3600,
+                            );
+                        }
+                        if reason == "INSUFFICIENT_FREE_PURSE" {
+                            bazaar_tracker_local_bz.record_failure(
+                                &flip.item_name,
+                                Some(&flip.product_id),
+                                "CANNOT_AFFORD",
+                                900,
+                            );
+                        }
                         continue;
                     }
                     if frikadellen_baf::utils::is_unstackable_item(
@@ -4181,12 +4440,26 @@ async fn main() -> Result<()> {
                         }
                     }
 
+                    bazaar_tracker_local_bz.record_candidate_selected(
+                        &flip.item_name,
+                        Some(&flip.product_id),
+                        flip.score,
+                    );
                     bazaar_tracker_local_bz.record_planned_local_sell(
                         &flip.item_name,
                         flip.sell_price_per_unit,
                         Some(flip.item_tag.clone()),
                     );
 
+                    info!(
+                        "[LocalBazaarAudit] selected item_name={} product_id={} expected_profit={:.0} expected_roi={:.2} expected_hold_minutes={:.1} score={:.0} reason_selected=PROFIT_PER_HOUR_SCORE",
+                        flip.item_name,
+                        flip.product_id,
+                        flip.total_profit,
+                        flip.roi_after_tax * 100.0,
+                        (60.0 / flip.estimated_cycles_per_hour.max(0.05)).max(1.0),
+                        flip.score
+                    );
                     info!(
                         "[LocalBazaar] Queued BUY {} x{} @ {:.1}; planned SELL @ {:.1}; profit {:.0}; risk-adj/h {:.0}; roi {:.2}%; cycles {:.2}; cap {:.0}; volValue/h {:.0}; risk {:?} {:?}",
                         flip.item_name,
@@ -4216,7 +4489,7 @@ async fn main() -> Result<()> {
                     command_queue_local_bz.enqueue(
                         CommandType::BazaarBuyOrder {
                             item_name: flip.item_name,
-                            item_tag: None,
+                            item_tag: Some(flip.item_tag.clone()),
                             amount: flip.amount,
                             price_per_unit: flip.buy_price_per_unit,
                         },
@@ -4298,10 +4571,9 @@ async fn main() -> Result<()> {
                     };
 
                     let key = format!("buy:{}", order_norm);
-                    if reprice_cooldowns
-                        .get(&key)
-                        .is_some_and(|last| last.elapsed().as_secs() < 120)
-                    {
+                    if reprice_cooldowns.get(&key).is_some_and(|last| {
+                        last.elapsed().as_secs() < local_reprice_cooldown_seconds
+                    }) {
                         continue;
                     }
 
@@ -4342,6 +4614,56 @@ async fn main() -> Result<()> {
                         break;
                     }
 
+                    let old_sell_price = fresh_sell_price;
+                    let old_expected_profit = (old_sell_price * tax_multiplier
+                        - order.price_per_unit)
+                        * order.amount as f64;
+                    let seconds_since_last = reprice_cooldowns
+                        .get(&key)
+                        .map(|i| i.elapsed().as_secs())
+                        .unwrap_or(u64::MAX);
+                    let reprice_decision = frikadellen_baf::bazaar_tracker::evaluate_reprice(
+                        old_expected_profit,
+                        total_profit,
+                        now_secs.saturating_sub(order.placed_at),
+                        seconds_since_last,
+                        0,
+                        local_min_reprice_profit_improvement,
+                        local_min_reprice_interval_seconds,
+                        local_max_reprices_per_item_per_hour,
+                        fresh_buy_price > order.price_per_unit * 1.01,
+                        false,
+                    );
+                    if !reprice_decision.allowed {
+                        debug!(
+                            "[LocalBazaarAudit] reprice skipped item_name={} old_price={:.1} new_price={:.1} old_expected_profit={:.0} new_expected_profit={:.0} improvement={:.0} reason={}",
+                            order.item_name,
+                            order.price_per_unit,
+                            fresh_buy_price,
+                            old_expected_profit,
+                            total_profit,
+                            reprice_decision.improvement,
+                            reprice_decision
+                                .reason
+                                .as_deref()
+                                .unwrap_or("REPRICE_REJECTED")
+                        );
+                        continue;
+                    }
+                    bazaar_tracker_reprice_bz.record_reprice(&order.item_name, None);
+                    info!(
+                        "[LocalBazaarAudit] reprice item_name={} old_price={:.1} new_price={:.1} old_expected_profit={:.0} new_expected_profit={:.0} improvement={:.0} reason_repriced={}",
+                        order.item_name,
+                        order.price_per_unit,
+                        fresh_buy_price,
+                        old_expected_profit,
+                        total_profit,
+                        reprice_decision.improvement,
+                        reprice_decision
+                            .reason
+                            .as_deref()
+                            .unwrap_or("REPRICE_ALLOWED")
+                    );
                     info!(
                         "[LocalBazaar] BUY {} outbid: old {:.1}, fresh {:.1}; relisting for estimated profit {:.0}",
                         order.item_name, order.price_per_unit, fresh_buy_price, total_profit
@@ -4714,13 +5036,17 @@ async fn main() -> Result<()> {
             if remaining_secs == 0 {
                 info!(
                     "[AccountSwitch] Session time ({:.1}h) already exceeds switch threshold ({:.1}h) — will switch after 30s startup grace",
-                    previous_session_secs as f64 / 3600.0, switch_hours
+                    previous_session_secs as f64 / 3600.0,
+                    switch_hours
                 );
             } else {
                 info!(
                     "[AccountSwitch] Will switch from {} to {} in {:.1}h (total {:.1}h, already {:.1}h)",
-                    ingame_name, next_name, remaining_secs as f64 / 3600.0,
-                    switch_hours, previous_session_secs as f64 / 3600.0
+                    ingame_name,
+                    next_name,
+                    remaining_secs as f64 / 3600.0,
+                    switch_hours,
+                    previous_session_secs as f64 / 3600.0
                 );
             }
             tokio::spawn(async move {
