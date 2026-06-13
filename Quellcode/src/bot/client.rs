@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use azalea::prelude::*;
 use azalea_client::chat::ChatPacket;
-use azalea_client::inventory::{MenuOpenedEvent, SetContainerContentEvent};
+use azalea_client::inventory::{Inventory, MenuOpenedEvent, SetContainerContentEvent};
 use azalea_inventory::operations::ClickType;
 use azalea_protocol::packets::game::{
     c_set_display_objective::DisplaySlot, c_set_player_team::Method as TeamMethod,
@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 
 use super::handlers::BotEventHandlers;
 use crate::state::CommandQueue;
-use crate::types::{BotState, QueuedCommand};
+use crate::types::{BotState, CommandPriority, CommandType, QueuedCommand};
 use crate::websocket::CoflWebSocket;
 
 /// Connection wait duration (seconds) - time to wait for bot connection to establish
@@ -409,6 +409,12 @@ pub enum BotEvent {
         price_per_unit: f64,
         is_buy_order: bool,
     },
+    /// A Bazaar order could not be placed before confirmation.
+    BazaarOrderFailed {
+        item_name: String,
+        is_buy_order: bool,
+        reason: String,
+    },
     /// AH BIN auction listed successfully
     AuctionListed {
         item_name: String,
@@ -778,6 +784,12 @@ impl BotClient {
                     .unwrap_or_else(|| display.clone())
             })
             .collect()
+    }
+
+    /// Returns true when the current sidebar looks like a SkyBlock context
+    /// where Bazaar commands such as `/bz <item>` are expected to exist.
+    pub fn has_skyblock_context(&self) -> bool {
+        scoreboard_has_skyblock_context(&self.get_scoreboard_lines())
     }
 
     /// Parse the player's current purse from the SkyBlock scoreboard sidebar.
@@ -1731,6 +1743,116 @@ fn format_price_for_sign(price: f64) -> String {
     }
 }
 
+fn bazaar_visible_item_command(item_name: &str) -> String {
+    format!("/bz {}", crate::utils::to_title_case(item_name))
+}
+
+fn scoreboard_has_skyblock_context(lines: &[String]) -> bool {
+    lines.iter().any(|line| {
+        let clean = remove_mc_colors(line);
+        let trimmed = clean.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        trimmed.starts_with("Purse: ")
+            || trimmed.starts_with("Piggy: ")
+            || lower.contains("skyblock")
+            || lower.contains("your island")
+            || lower.starts_with("area: ")
+    })
+}
+
+fn state_scoreboard_lines(state: &BotClientState) -> Vec<String> {
+    let sidebar = state.sidebar_objective.read();
+    let Some(sidebar_name) = sidebar.as_ref().cloned() else {
+        return Vec::new();
+    };
+    drop(sidebar);
+
+    let scores = state.scoreboard_scores.read();
+    let Some(objective) = scores.get(&sidebar_name) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<(&String, &(String, u32))> = objective.iter().collect();
+    entries.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+
+    let teams = state.scoreboard_teams.read();
+    let mut member_display: HashMap<String, String> = HashMap::new();
+    for (_, (prefix, suffix, members)) in teams.iter() {
+        let text = format!("{}{}", prefix, suffix);
+        for member in members {
+            member_display.insert(member.clone(), text.clone());
+        }
+    }
+    drop(teams);
+
+    entries
+        .iter()
+        .map(|(owner, (display, _))| {
+            member_display
+                .get(owner.as_str())
+                .cloned()
+                .unwrap_or_else(|| display.clone())
+        })
+        .collect()
+}
+
+fn state_has_skyblock_context(state: &BotClientState) -> bool {
+    scoreboard_has_skyblock_context(&state_scoreboard_lines(state))
+}
+
+fn is_unknown_bazaar_command_message(clean_message: &str) -> bool {
+    let lower = clean_message.to_ascii_lowercase();
+    lower.contains("unknown command")
+        && (lower.contains("('bz ") || lower.contains("(\"bz ") || lower.contains("`bz "))
+}
+
+fn spawn_skyblock_recovery_sequence(state: &BotClientState, reason: &'static str) {
+    let queue = state.command_queue.read().clone();
+    let Some(command_queue) = queue else {
+        warn!(
+            "[BAF][RECOVERY] Cannot queue SkyBlock recovery — no command queue ({})",
+            reason
+        );
+        return;
+    };
+
+    if state.startup_in_progress.swap(true, Ordering::Relaxed) {
+        debug!(
+            "[BAF][RECOVERY] SkyBlock recovery already in progress; ignoring duplicate trigger ({})",
+            reason
+        );
+        return;
+    }
+    *state.joined_skyblock.write() = false;
+    *state.teleported_to_island.write() = false;
+    *state.skyblock_join_time.write() = Some(tokio::time::Instant::now());
+
+    warn!(
+        "[BAF][RECOVERY] Bazaar command unavailable — returning to SkyBlock ({})",
+        reason
+    );
+    command_queue.enqueue(
+        CommandType::SendChat {
+            message: "/play sb".to_string(),
+        },
+        CommandPriority::Critical,
+        false,
+    );
+
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(
+            TELEPORT_COMPLETION_WAIT_SECS + SKYBLOCK_JOIN_TIMEOUT_SECS.min(10),
+        ))
+        .await;
+        command_queue.enqueue(
+            CommandType::SendChat {
+                message: "/is".to_string(),
+            },
+            CommandPriority::Critical,
+            false,
+        );
+    });
+}
+
 /// Insert commas as thousands separators into an integer.
 /// Handles negative numbers correctly: -1234567 → "-1,234,567".
 fn format_with_commas(n: i64) -> String {
@@ -2412,6 +2534,21 @@ async fn event_handler(bot: Client, event: Event, state: BotClientState) -> Resu
             let clean_message =
                 crate::bot::handlers::BotEventHandlers::remove_color_codes(&message);
 
+            if is_unknown_bazaar_command_message(&clean_message) {
+                warn!(
+                    "[BAF][RECOVERY] Bazaar command was rejected outside usable SkyBlock context: {}",
+                    clean_message
+                );
+                state.bazaar_order_rejected.store(true, Ordering::Relaxed);
+                let window_id = *state.last_window_id.read();
+                if window_id > 0 {
+                    send_raw_close(&bot, window_id, &state.handlers);
+                }
+                *state.bazaar_step.write() = BazaarStep::Initial;
+                *state.bot_state.write() = BotState::Idle;
+                spawn_skyblock_recovery_sequence(&state, "UNKNOWN_BZ_COMMAND");
+            }
+
             if clean_message.contains("You purchased") && clean_message.contains("coins!") {
                 // "You purchased <item> for <price> coins!"
                 if let Some((item_name, price)) = parse_purchased_message(&clean_message) {
@@ -3041,8 +3178,14 @@ async fn event_handler(bot: Client, event: Event, state: BotClientState) -> Resu
                         let wdog_deadline = state.manage_orders_deadline.clone();
                         let wdog_bz_limit = state.bazaar_at_limit.clone();
                         let wdog_handlers = state.handlers.clone();
+                        let wdog_timeout_secs = if *state.bot_state.read() == BotState::Bazaar {
+                            15
+                        } else {
+                            5
+                        };
                         tokio::spawn(async move {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_secs(wdog_timeout_secs))
+                                .await;
                             let still_open = *wdog_last.read() == wdog_wid;
                             let cur_state = *wdog_state.read();
                             let is_bed = wdog_bed.load(Ordering::Relaxed);
@@ -3062,8 +3205,8 @@ async fn event_handler(bot: Client, event: Event, state: BotClientState) -> Resu
                             let gen_unchanged = wdog_gen.load(Ordering::SeqCst) == wdog_gen_at_open;
                             if still_open && is_interactive && !is_bed && gen_unchanged {
                                 warn!(
-                                    "[GUI] Window {} open for >5 s in state {:?} — auto-closing",
-                                    wdog_wid, cur_state
+                                    "[GUI] Window {} open for >{} s in state {:?} — auto-closing",
+                                    wdog_wid, wdog_timeout_secs, cur_state
                                 );
                                 send_raw_close(&wdog_bot, wdog_wid, &wdog_handlers);
                                 // Clean up ManagingOrders-specific state so the bot
@@ -3234,12 +3377,14 @@ async fn event_handler(bot: Client, event: Event, state: BotClientState) -> Resu
                         let text_to_write = match step {
                             BazaarStep::SetAmount => {
                                 let amount = *state.bazaar_amount.read();
+                                info!("[BAF][BAZAAR_FLOW] sign_amount amount={}", amount);
                                 info!("[Bazaar] Sign opened for amount — writing: {}", amount);
                                 amount.to_string()
                             }
                             BazaarStep::SetPrice => {
                                 let price = *state.bazaar_price_per_unit.read();
                                 let s = format_price_for_sign(price);
+                                info!("[BAF][BAZAAR_FLOW] sign_price price={}", s);
                                 info!("[Bazaar] Sign opened for price — writing: {}", s);
                                 s
                             }
@@ -3250,6 +3395,7 @@ async fn event_handler(bot: Client, event: Event, state: BotClientState) -> Resu
                                 // sell offers go straight to the price sign).
                                 let price = *state.bazaar_price_per_unit.read();
                                 let s = format_price_for_sign(price);
+                                info!("[BAF][BAZAAR_FLOW] sign_price_direct price={}", s);
                                 info!("[Bazaar] Sign opened at SelectOrderType (direct sign) — writing price: {}", s);
                                 *state.bazaar_step.write() = BazaarStep::SetPrice;
                                 s
@@ -3568,6 +3714,14 @@ async fn execute_command(bot: &Client, command: &QueuedCommand, state: &BotClien
                 );
                 return;
             }
+            if !state_has_skyblock_context(state) {
+                warn!(
+                    "[BAF][RECOVERY] Skipping BUY order for \"{}\" — SkyBlock scoreboard context is not ready",
+                    item_name
+                );
+                spawn_skyblock_recovery_sequence(state, "BUY_WITHOUT_SKYBLOCK_CONTEXT");
+                return;
+            }
             // Store order context so window/sign handlers can use it
             *state.bazaar_item_name.write() = item_name.clone();
             *state.bazaar_amount.write() = *amount;
@@ -3575,18 +3729,12 @@ async fn execute_command(bot: &Client, command: &QueuedCommand, state: &BotClien
             *state.bazaar_is_buy_order.write() = true;
             *state.bazaar_step.write() = BazaarStep::Initial;
 
-            // Use itemTag when available (skips search results page), else title-case itemName
-            let search_term = item_tag
-                .as_ref()
-                .map(|s| s.as_str())
-                .unwrap_or_else(|| item_name.as_str());
-            let cmd = if item_tag.is_some() {
-                format!("/bz {}", search_term)
-            } else {
-                format!("/bz {}", crate::utils::to_title_case(search_term))
-            };
+            // Hypixel's `/bz <term>` resolves visible item names more reliably
+            // than API product IDs such as SUMMONING_EYE or CARROT_ZEST.
+            let _ = item_tag;
+            let cmd = bazaar_visible_item_command(item_name);
             info!("Sending bazaar buy order command: {}", cmd);
-            send_chat_command(bot, &cmd);
+            send_raw_chat_command(bot, &cmd);
             *state.bot_state.write() = BotState::Bazaar;
         }
         CommandType::BazaarSellOrder {
@@ -3602,6 +3750,26 @@ async fn execute_command(bot: &Client, command: &QueuedCommand, state: &BotClien
             if state.bazaar_at_limit.load(Ordering::Relaxed) {
                 info!("[Bazaar] Attempting SELL order for \"{}\" despite at_limit flag (sell orders are critical)", item_name);
             }
+            if !state_has_skyblock_context(state) {
+                warn!(
+                    "[BAF][RECOVERY] Delaying SELL order for \"{}\" — SkyBlock scoreboard context is not ready",
+                    item_name
+                );
+                spawn_skyblock_recovery_sequence(state, "SELL_WITHOUT_SKYBLOCK_CONTEXT");
+                if let Some(command_queue) = state.command_queue.read().clone() {
+                    command_queue.enqueue(
+                        CommandType::BazaarSellOrder {
+                            item_name: item_name.clone(),
+                            item_tag: item_tag.clone(),
+                            amount: *amount,
+                            price_per_unit: *price_per_unit,
+                        },
+                        CommandPriority::High,
+                        false,
+                    );
+                }
+                return;
+            }
             // Store order context so window/sign handlers can use it
             *state.bazaar_item_name.write() = item_name.clone();
             *state.bazaar_amount.write() = *amount;
@@ -3609,18 +3777,13 @@ async fn execute_command(bot: &Client, command: &QueuedCommand, state: &BotClien
             *state.bazaar_is_buy_order.write() = false;
             *state.bazaar_step.write() = BazaarStep::Initial;
 
-            // Use itemTag when available, else title-case itemName
-            let search_term = item_tag
-                .as_ref()
-                .map(|s| s.as_str())
-                .unwrap_or_else(|| item_name.as_str());
-            let cmd = if item_tag.is_some() {
-                format!("/bz {}", search_term)
-            } else {
-                format!("/bz {}", crate::utils::to_title_case(search_term))
-            };
+            // SELL recovery must use the visible product name. Some Hypixel Bazaar
+            // pages do not resolve item tags such as CARROT_ZEST in `/bz <term>`,
+            // which opens a "No Product Found" page and leaves CostLots unsold.
+            let _ = item_tag;
+            let cmd = bazaar_visible_item_command(item_name);
             info!("Sending bazaar sell order command: {}", cmd);
-            send_chat_command(bot, &cmd);
+            send_raw_chat_command(bot, &cmd);
             *state.bot_state.write() = BotState::Bazaar;
         }
         // Advanced command types (matching TypeScript BAF.ts)
@@ -3837,6 +4000,16 @@ async fn handle_window_interaction(
     }
 
     let bot_state = *state.bot_state.read();
+    if bot_state == BotState::Bazaar {
+        info!(
+            "[BAF][BAZAAR_FLOW] handler_start window={} title=\"{}\" step={:?} item=\"{}\" sell={}",
+            window_id,
+            window_title,
+            *state.bazaar_step.read(),
+            state.bazaar_item_name.read().as_str(),
+            !*state.bazaar_is_buy_order.read()
+        );
+    }
 
     match bot_state {
         BotState::Purchasing => {
@@ -4261,13 +4434,6 @@ async fn handle_window_interaction(
                 window_title, current_step
             );
 
-            // Poll every 50ms for up to 1500ms for slots to be populated by ContainerSetContent.
-            // Matching TypeScript's findAndClick() poll pattern (checks every 50ms, up to ~600ms).
-            // This is more reliable than a fixed sleep because ContainerSetContent may arrive
-            // at any time after OpenScreen.
-            let poll_deadline =
-                tokio::time::Instant::now() + tokio::time::Duration::from_millis(1500);
-
             // Helper: read the current slots from the menu
             let read_slots = || {
                 let menu = bot.menu();
@@ -4281,45 +4447,64 @@ async fn handle_window_interaction(
                 "Create Sell Offer"
             };
 
-            // Step 2: Item-detail page — poll for the order-creation button.
-            // Only relevant when we haven't clicked an order button yet (Initial or SearchResults).
-            // Skipped for SelectOrderType and beyond because order buttons only appear on the
-            // item-detail page, not on price/amount/confirm screens.
-            if current_step == BazaarStep::Initial || current_step == BazaarStep::SearchResults {
-                // Poll until we find either "Create Buy Order" or "Create Sell Offer"
-                let order_button_slot = loop {
-                    // Guard: if a newer window has opened this handler is stale — bail out.
+            // Step 1: Search-results or direct item-detail page.
+            //
+            // `/bz <visible item name>` may open either:
+            // - a filtered search-results page that contains the product item, or
+            // - the item-detail page that already contains Create Buy/Sell buttons.
+            //
+            // Handle this first so a SELL recovery command cannot spend its whole
+            // window lifetime waiting for a button that only exists after the item
+            // itself has been clicked.
+            if current_step == BazaarStep::Initial && window_title.contains("Bazaar") {
+                info!("[Bazaar] Initial page: looking for \"{}\"", item_name);
+                info!(
+                    "[BAF][BAZAAR_FLOW] initial_scan window={} item=\"{}\" button=\"{}\"",
+                    window_id, item_name, order_btn_name
+                );
+                let poll_deadline =
+                    tokio::time::Instant::now() + tokio::time::Duration::from_millis(2500);
+
+                enum InitialBazaarTarget {
+                    OrderButton(usize),
+                    Product(usize),
+                }
+
+                let mut attempts = 0u32;
+                let target = loop {
                     if *state.last_window_id.read() != window_id {
-                        debug!(
-                            "[Bazaar] Window {} superseded during order-button poll, aborting",
-                            window_id
-                        );
                         return;
                     }
+                    if attempts == 0 {
+                        info!(
+                            "[BAF][BAZAAR_FLOW] initial_read_slots_start window={}",
+                            window_id
+                        );
+                    }
                     let slots = read_slots();
-                    let buy_s = find_slot_by_name(&slots, "Create Buy Order");
-                    let sell_s = find_slot_by_name(&slots, "Create Sell Offer");
-                    let found = if is_buy_order { buy_s } else { sell_s };
-                    if found.is_some() {
-                        break found;
+                    if attempts == 0 {
+                        info!(
+                            "[BAF][BAZAAR_FLOW] initial_read_slots_done window={} slots={}",
+                            window_id,
+                            slots.len()
+                        );
                     }
-                    // Also break early if we're on a search-results or amount/price screen
-                    // (those don't have order buttons, no point waiting)
-                    let has_custom_amount = find_slot_by_name(&slots, "Custom Amount").is_some();
-                    let has_custom_price = find_slot_by_name(&slots, "Custom Price").is_some();
-                    if has_custom_amount || has_custom_price {
-                        break None;
+                    attempts += 1;
+                    let order_slot = if is_buy_order {
+                        find_slot_by_name(&slots, "Create Buy Order")
+                    } else {
+                        find_slot_by_name(&slots, "Create Sell Offer")
+                    };
+                    if let Some(i) = order_slot {
+                        break Some(InitialBazaarTarget::OrderButton(i));
                     }
-                    // Any window with "Bazaar" in the title is a search-results / category page —
-                    // those never contain order buttons, so break immediately.
-                    if window_title.contains("Bazaar") {
-                        break None;
+                    if let Some(i) = find_slot_by_name(&slots, &item_name) {
+                        break Some(InitialBazaarTarget::Product(i));
                     }
                     if tokio::time::Instant::now() >= poll_deadline {
-                        // Log all non-empty slots for debugging
                         warn!(
-                            "[Bazaar] Polling timed out waiting for \"{}\" in \"{}\"",
-                            order_btn_name, window_title
+                            "[Bazaar] Timed out finding product \"{}\" or \"{}\" in \"{}\"",
+                            item_name, order_btn_name, window_title
                         );
                         for (i, item) in slots.iter().enumerate() {
                             if let Some(name) = get_item_display_name_from_slot(item) {
@@ -4331,82 +4516,142 @@ async fn handle_window_interaction(
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 };
 
-                if let Some(i) = order_button_slot {
-                    // Final guard before clicking — reject if a newer window has taken over.
-                    if *state.last_window_id.read() != window_id {
-                        debug!(
-                            "[Bazaar] Window {} superseded before order-button click, aborting",
-                            window_id
+                match target {
+                    Some(InitialBazaarTarget::OrderButton(i)) => {
+                        if *state.last_window_id.read() != window_id {
+                            return;
+                        }
+                        info!(
+                            "[BAF][BAZAAR_FLOW] click_order_button window={} slot={} button=\"{}\"",
+                            window_id, i, order_btn_name
                         );
-                        return;
+                        info!(
+                            "[Bazaar] Direct item detail: clicking \"{}\" at slot {}",
+                            order_btn_name, i
+                        );
+                        *state.bazaar_step.write() = BazaarStep::SelectOrderType;
+                        click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     }
-                    info!(
-                        "[Bazaar] Item detail: clicking \"{}\" at slot {}",
-                        order_btn_name, i
-                    );
-                    *state.bazaar_step.write() = BazaarStep::SelectOrderType;
-                    // Add randomized human-like delay before clicking (200-500ms)
-                    let jitter = 200
-                        + (std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .subsec_nanos()
-                            % 300) as u64;
-                    tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
-                    if *state.last_window_id.read() != window_id {
-                        return;
+                    Some(InitialBazaarTarget::Product(i)) => {
+                        if *state.last_window_id.read() != window_id {
+                            return;
+                        }
+                        info!(
+                            "[BAF][BAZAAR_FLOW] click_product window={} slot={} item=\"{}\"",
+                            window_id, i, item_name
+                        );
+                        info!("[Bazaar] Search result: clicking product at slot {}", i);
+                        *state.bazaar_step.write() = BazaarStep::SearchResults;
+                        click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     }
-                    click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
-                    return;
+                    None => {
+                        let _ = state.event_tx.send(BotEvent::BazaarOrderFailed {
+                            item_name: item_name.clone(),
+                            is_buy_order,
+                            reason: "PRODUCT_LOOKUP_FAILED".to_string(),
+                        });
+                        send_raw_close(bot, window_id, &state.handlers);
+                        *state.bot_state.write() = BotState::Idle;
+                    }
                 }
+                return;
             }
 
-            // Step 1: Search-results page — "Bazaar" in title, step == Initial.
-            // Handles both "Bazaar" (plain search) and "Bazaar ➜ "ItemName"" (filtered results)
-            // where the item appears in the grid but order buttons are not yet visible.
-            if window_title.contains("Bazaar") && current_step == BazaarStep::Initial {
-                info!("[Bazaar] Search results: looking for \"{}\"", item_name);
-                *state.bazaar_step.write() = BazaarStep::SearchResults;
-
-                // Poll briefly for the item to appear in search results
-                let found = loop {
+            // Step 2: Item-detail page — poll for the order-creation button.
+            if current_step == BazaarStep::SearchResults {
+                info!(
+                    "[BAF][BAZAAR_FLOW] detail_scan window={} item=\"{}\" button=\"{}\"",
+                    window_id, item_name, order_btn_name
+                );
+                let poll_deadline =
+                    tokio::time::Instant::now() + tokio::time::Duration::from_millis(2500);
+                let mut fallback_product_slot = None;
+                let mut attempts = 0u32;
+                let order_button_slot = loop {
                     if *state.last_window_id.read() != window_id {
                         return;
                     }
+                    if attempts == 0 {
+                        info!(
+                            "[BAF][BAZAAR_FLOW] detail_read_slots_start window={}",
+                            window_id
+                        );
+                    }
                     let slots = read_slots();
-                    let f = find_slot_by_name(&slots, &item_name);
-                    if f.is_some() || tokio::time::Instant::now() >= poll_deadline {
-                        break f;
+                    if attempts == 0 {
+                        info!(
+                            "[BAF][BAZAAR_FLOW] detail_read_slots_done window={} slots={}",
+                            window_id,
+                            slots.len()
+                        );
+                    }
+                    attempts += 1;
+                    let order_slot = if is_buy_order {
+                        find_slot_by_name(&slots, "Create Buy Order")
+                    } else {
+                        find_slot_by_name(&slots, "Create Sell Offer")
+                    };
+                    if order_slot.is_some() {
+                        break order_slot;
+                    }
+                    if fallback_product_slot.is_none() {
+                        fallback_product_slot = find_slot_by_name(&slots, &item_name);
+                    }
+                    if tokio::time::Instant::now() >= poll_deadline {
+                        warn!(
+                            "[Bazaar] Timed out waiting for \"{}\" after selecting \"{}\"",
+                            order_btn_name, item_name
+                        );
+                        for (i, item) in slots.iter().enumerate() {
+                            if let Some(name) = get_item_display_name_from_slot(item) {
+                                warn!("[Bazaar]   slot {}: {}", i, name);
+                            }
+                        }
+                        break None;
                     }
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 };
 
-                match found {
+                match order_button_slot {
                     Some(i) => {
                         if *state.last_window_id.read() != window_id {
                             return;
                         }
-                        info!("[Bazaar] Found item at slot {}", i);
-                        // Add randomized human-like delay (200-450ms)
-                        let jitter = 200
-                            + (std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .subsec_nanos()
-                                % 250) as u64;
-                        tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
-                        if *state.last_window_id.read() != window_id {
-                            return;
-                        }
+                        info!(
+                            "[BAF][BAZAAR_FLOW] click_order_button window={} slot={} button=\"{}\"",
+                            window_id, i, order_btn_name
+                        );
+                        info!(
+                            "[Bazaar] Item detail: clicking \"{}\" at slot {}",
+                            order_btn_name, i
+                        );
+                        *state.bazaar_step.write() = BazaarStep::SelectOrderType;
                         click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                     }
                     None => {
-                        warn!(
-                            "[Bazaar] Item \"{}\" not found in search results; going idle",
-                            item_name
-                        );
-                        send_raw_close(bot, window_id, &state.handlers);
-                        *state.bot_state.write() = BotState::Idle;
+                        if let Some(i) = fallback_product_slot {
+                            if *state.last_window_id.read() != window_id {
+                                return;
+                            }
+                            warn!(
+                                "[Bazaar] Order button missing; retrying product click at slot {}",
+                                i
+                            );
+                            click_window_slot(bot, &state.last_window_id, window_id, i as i16)
+                                .await;
+                        } else {
+                            warn!(
+                                "[Bazaar] Could not reach item detail for \"{}\"; going idle",
+                                item_name
+                            );
+                            let _ = state.event_tx.send(BotEvent::BazaarOrderFailed {
+                                item_name: item_name.clone(),
+                                is_buy_order,
+                                reason: "ORDER_BUTTON_NOT_FOUND".to_string(),
+                            });
+                            send_raw_close(bot, window_id, &state.handlers);
+                            *state.bot_state.write() = BotState::Idle;
+                        }
                     }
                 }
                 return;
@@ -4446,6 +4691,10 @@ async fn handle_window_interaction(
                     "[Bazaar] Amount screen: clicking Custom Amount at slot {}",
                     i
                 );
+                info!(
+                    "[BAF][BAZAAR_FLOW] click_custom_amount window={} slot={}",
+                    window_id, i
+                );
                 *state.bazaar_step.write() = BazaarStep::SetAmount;
                 click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                 // Sign response is sent in the OpenSignEditor packet handler
@@ -4460,6 +4709,10 @@ async fn handle_window_interaction(
                     return;
                 }
                 info!("[Bazaar] Price screen: clicking Custom Price at slot {}", i);
+                info!(
+                    "[BAF][BAZAAR_FLOW] click_custom_price window={} slot={}",
+                    window_id, i
+                );
                 *state.bazaar_step.write() = BazaarStep::SetPrice;
                 click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                 // Sign response is sent in the OpenSignEditor packet handler
@@ -4470,18 +4723,14 @@ async fn handle_window_interaction(
                     return;
                 }
                 info!("[Bazaar] Confirm screen: clicking slot 13");
+                info!(
+                    "[BAF][BAZAAR_FLOW] click_confirm window={} slot=13",
+                    window_id
+                );
                 *state.bazaar_step.write() = BazaarStep::Confirm;
                 // Clear rejection flag before clicking so we only capture the
                 // response to *this* placement attempt.
                 state.bazaar_order_rejected.store(false, Ordering::Relaxed);
-                // Add randomized human-like delay before confirming (300-700ms)
-                let jitter = 300
-                    + (std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .subsec_nanos()
-                        % 400) as u64;
-                tokio::time::sleep(tokio::time::Duration::from_millis(jitter)).await;
                 click_window_slot(bot, &state.last_window_id, window_id, 13).await;
 
                 // Wait briefly for the server to respond (limit/rejection message arrives asynchronously)
@@ -4503,6 +4752,13 @@ async fn handle_window_interaction(
                         price_per_unit,
                         is_buy_order,
                     });
+                    info!(
+                        "[BAF][BAZAAR_FLOW] order_complete item=\"{}\" amount={} price_per_unit={} sell={}",
+                        item_name,
+                        amount,
+                        price_per_unit,
+                        !is_buy_order
+                    );
                     info!("[Bazaar] ===== ORDER COMPLETE =====");
                 }
                 send_raw_close(bot, window_id, &state.handlers);
@@ -6581,13 +6837,23 @@ fn resolve_pet_tag(tag: &str, nbt_data: &serde_json::Value) -> String {
     tag.to_string()
 }
 
+fn try_current_menu(bot: &Client) -> Option<azalea_inventory::Menu> {
+    bot.get_component::<Inventory>()
+        .map(|inv| inv.menu().clone())
+}
+
 /// Rebuild and cache the player-inventory JSON from the bot's current menu.
 ///
 /// Called after every ContainerSetContent / ContainerSetSlot so that
 /// `BotClient::get_cached_inventory_json()` always returns fresh data.
 /// The serialised format matches TypeScript `JSON.stringify(bot.inventory)`.
 fn rebuild_cached_inventory_json(bot: &Client, state: &BotClientState) {
-    let menu = bot.menu();
+    let Some(menu) = try_current_menu(bot) else {
+        warn!(
+            "[Inventory] Skipping cache rebuild because the bot inventory component is unavailable"
+        );
+        return;
+    };
     let all_slots = menu.slots();
     let player_range = menu.player_slots_range();
 
@@ -6812,7 +7078,10 @@ fn rebuild_cached_window_json(bot: &Client, state: &BotClientState) {
     };
 
     // Read ALL window slots (GUI slots + player inventory in the window)
-    let menu = bot.menu();
+    let Some(menu) = try_current_menu(bot) else {
+        warn!("[Window] Skipping cache rebuild because the bot inventory component is unavailable");
+        return;
+    };
     let all_slots = menu.slots();
 
     let mut slots_json: Vec<serde_json::Value> = Vec::with_capacity(all_slots.len());
@@ -7384,11 +7653,17 @@ fn send_raw_chat_command(bot: &Client, content: &str) {
     let cmd_packet = ServerboundChatCommand {
         command: command.to_string(),
     };
-    bot.with_raw_connection_mut(|mut raw_conn| {
-        if let Err(e) = raw_conn.write(cmd_packet) {
-            error!("raw chat command write failed: {e}");
-        }
-    });
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        bot.with_raw_connection_mut(|mut raw_conn| {
+            if let Err(e) = raw_conn.write(cmd_packet) {
+                error!("raw chat command write failed: {e}");
+            }
+        });
+    }))
+    .is_err()
+    {
+        warn!("raw chat command skipped because the bot connection is no longer available");
+    }
 }
 
 /// Send a container click packet directly to the TCP socket via
@@ -7409,14 +7684,23 @@ fn send_raw_click(bot: &Client, window_id: u8, slot: i16) {
         changed_slots: Default::default(),
         carried_item: HashedStack(None),
     };
-    bot.with_raw_connection_mut(|mut raw_conn| {
-        if let Err(e) = raw_conn.write(packet) {
-            error!(
-                "raw click write failed (window {} slot {}): {e}",
-                window_id, slot
-            );
-        }
-    });
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        bot.with_raw_connection_mut(|mut raw_conn| {
+            if let Err(e) = raw_conn.write(packet) {
+                error!(
+                    "raw click write failed (window {} slot {}): {e}",
+                    window_id, slot
+                );
+            }
+        });
+    }))
+    .is_err()
+    {
+        warn!(
+            "raw click skipped because the bot connection is no longer available (window {} slot {})",
+            window_id, slot
+        );
+    }
     info!("Raw-clicked slot {} in window {}", slot, window_id);
 }
 
@@ -7438,16 +7722,25 @@ fn send_raw_click(bot: &Client, window_id: u8, slot: i16) {
 /// does send `ClientboundContainerClose`, the `ContainerClose` handler
 /// re-clears the already-`None` fields.
 fn send_raw_close(bot: &Client, window_id: u8, handlers: &BotEventHandlers) {
-    bot.with_raw_connection_mut(|mut raw_conn| {
-        if let Err(e) = raw_conn.write(ServerboundContainerClose {
-            container_id: window_id as i32,
-        }) {
-            error!(
-                "raw container close write failed (window {}): {e}",
-                window_id
-            );
-        }
-    });
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        bot.with_raw_connection_mut(|mut raw_conn| {
+            if let Err(e) = raw_conn.write(ServerboundContainerClose {
+                container_id: window_id as i32,
+            }) {
+                error!(
+                    "raw container close write failed (window {}): {e}",
+                    window_id
+                );
+            }
+        });
+    }))
+    .is_err()
+    {
+        warn!(
+            "raw close skipped because the bot connection is no longer available (window {})",
+            window_id
+        );
+    }
     handlers.clear_window_tracking();
     debug!("Raw-closed window {}", window_id);
 }
@@ -7619,14 +7912,23 @@ async fn click_window_slot_carrying(
         carried_item,
     };
 
-    bot.with_raw_connection_mut(|mut raw_conn| {
-        if let Err(e) = raw_conn.write(packet) {
-            error!(
-                "raw click (carrying) write failed (window {} slot {}): {e}",
-                window_id, slot
-            );
-        }
-    });
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        bot.with_raw_connection_mut(|mut raw_conn| {
+            if let Err(e) = raw_conn.write(packet) {
+                error!(
+                    "raw click (carrying) write failed (window {} slot {}): {e}",
+                    window_id, slot
+                );
+            }
+        });
+    }))
+    .is_err()
+    {
+        warn!(
+            "raw click (carrying) skipped because the bot connection is no longer available (window {} slot {})",
+            window_id, slot
+        );
+    }
     info!(
         "Raw-clicked slot {} in window {} (carrying item)",
         slot, window_id
@@ -8581,6 +8883,48 @@ mod tests {
         assert_eq!(format_price_for_sign(1662.0), "1,662");
         assert_eq!(format_price_for_sign(60000000.0), "60,000,000");
         assert_eq!(format_price_for_sign(50000002.0), "50,000,002");
+    }
+
+    #[test]
+    fn test_bazaar_visible_item_command_uses_product_name_not_api_tag() {
+        assert_eq!(
+            bazaar_visible_item_command("Summoning Eye"),
+            "/bz Summoning Eye"
+        );
+        assert_ne!(
+            bazaar_visible_item_command("Summoning Eye"),
+            "/bz SUMMONING_EYE"
+        );
+        assert_eq!(
+            bazaar_visible_item_command("Carrot Zest"),
+            "/bz Carrot Zest"
+        );
+    }
+
+    #[test]
+    fn test_unknown_bazaar_command_detection() {
+        assert!(is_unknown_bazaar_command_message(
+            "Unknown command. Type \"/help\" for help. ('bz Kismet Feather')"
+        ));
+        assert!(is_unknown_bazaar_command_message(
+            "Unknown command. Type \"/help\" for help. (\"bz Glossy Gemstone\")"
+        ));
+        assert!(!is_unknown_bazaar_command_message(
+            "Unknown command. Type \"/help\" for help. ('warp garden')"
+        ));
+    }
+
+    #[test]
+    fn test_scoreboard_skyblock_context_detection() {
+        assert!(scoreboard_has_skyblock_context(&[
+            "Purse: 36,000,000".to_string(),
+            "Your Island".to_string(),
+        ]));
+        assert!(scoreboard_has_skyblock_context(&["Area: Hub".to_string()]));
+        assert!(!scoreboard_has_skyblock_context(&[
+            "Prototype Lobby".to_string(),
+            "Players: 42".to_string(),
+        ]));
     }
 
     #[test]

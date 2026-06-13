@@ -108,7 +108,7 @@ impl CommandQueue {
             return Some(current.clone());
         }
 
-        // Remove stale bazaar commands (older than 60 seconds)
+        // Remove stale BUY recommendations (older than 60 seconds)
         self.remove_stale_commands();
 
         self.queue.read().front().cloned()
@@ -178,7 +178,11 @@ impl CommandQueue {
         info!("Cleared all commands from queue");
     }
 
-    /// Remove stale commands (bazaar orders older than 60 seconds)
+    /// Remove stale BUY recommendation commands.
+    ///
+    /// SELL orders are lifecycle-critical: dropping a queued SELL can leave
+    /// FIFO CostLots in inventory with no active sell order, which stalls the
+    /// whole Bazaar loop. BUY recommendations may expire; SELL obligations may not.
     fn remove_stale_commands(&self) {
         let mut queue = self.queue.write();
         let now = Instant::now();
@@ -188,12 +192,7 @@ impl CommandQueue {
         queue.retain(|cmd| {
             let age = now.duration_since(cmd.queued_at);
 
-            // Only remove stale bazaar commands
-            if matches!(
-                cmd.command_type,
-                CommandType::BazaarBuyOrder { .. } | CommandType::BazaarSellOrder { .. }
-            ) && age > max_age
-            {
+            if matches!(cmd.command_type, CommandType::BazaarBuyOrder { .. }) && age > max_age {
                 debug!("Removing stale command {:?} (age: {:?})", cmd.id, age);
                 false
             } else {
@@ -207,6 +206,68 @@ impl CommandQueue {
                 original_len - queue.len()
             );
         }
+    }
+
+    /// Returns true if a SELL order for the item is already queued or running.
+    pub fn has_bazaar_sell_order_for(&self, item_name: &str) -> bool {
+        let target = normalize_queue_item(item_name);
+        if let Some(ref cur) = *self.current_command.read() {
+            if let CommandType::BazaarSellOrder { item_name, .. } = &cur.command_type {
+                if normalize_queue_item(item_name) == target {
+                    return true;
+                }
+            }
+        }
+        self.queue.read().iter().any(|cmd| {
+            if let CommandType::BazaarSellOrder { item_name, .. } = &cmd.command_type {
+                normalize_queue_item(item_name) == target
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Returns true if a BUY order for the item is already queued or running.
+    pub fn has_bazaar_buy_order_for(&self, item_name: &str) -> bool {
+        let target = normalize_queue_item(item_name);
+        if let Some(ref cur) = *self.current_command.read() {
+            if let CommandType::BazaarBuyOrder { item_name, .. } = &cur.command_type {
+                if normalize_queue_item(item_name) == target {
+                    return true;
+                }
+            }
+        }
+        self.queue.read().iter().any(|cmd| {
+            if let CommandType::BazaarBuyOrder { item_name, .. } = &cmd.command_type {
+                normalize_queue_item(item_name) == target
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Remove queued, not-yet-running SELL orders for an item. Used when an
+    /// existing active in-game SELL must be cancelled and relisted as one
+    /// consolidated order.
+    pub fn remove_queued_bazaar_sell_orders_for(&self, item_name: &str) -> usize {
+        let target = normalize_queue_item(item_name);
+        let mut queue = self.queue.write();
+        let original_len = queue.len();
+        queue.retain(|cmd| match &cmd.command_type {
+            CommandType::BazaarSellOrder {
+                item_name: queued_item,
+                ..
+            } => normalize_queue_item(queued_item) != target,
+            _ => true,
+        });
+        let removed = original_len - queue.len();
+        if removed > 0 {
+            info!(
+                "[Queue] Removed {} queued Bazaar SELL order(s) for {} before consolidation",
+                removed, item_name
+            );
+        }
+        removed
     }
 
     /// Get queue size
@@ -284,6 +345,14 @@ impl CommandQueue {
         }
         entries
     }
+}
+
+fn normalize_queue_item(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
 }
 
 /// A single entry in the queue snapshot, serializable for the web API.
@@ -387,6 +456,15 @@ mod tests {
         }
     }
 
+    fn dummy_bazaar_sell() -> CommandType {
+        CommandType::BazaarSellOrder {
+            item_name: "Coal".into(),
+            item_tag: None,
+            amount: 64,
+            price_per_unit: 12.0,
+        }
+    }
+
     #[test]
     fn has_manage_orders_detects_queued() {
         let q = CommandQueue::new();
@@ -412,5 +490,63 @@ mod tests {
         // Complete it — should no longer be detected
         q.complete_current();
         assert!(!q.has_manage_orders());
+    }
+
+    #[test]
+    fn stale_buy_commands_expire_but_sell_obligations_do_not() {
+        let q = CommandQueue::new();
+        q.enqueue(dummy_bazaar_buy(), CommandPriority::Normal, true);
+        q.enqueue(dummy_bazaar_sell(), CommandPriority::Critical, true);
+        {
+            let mut queue = q.queue.write();
+            for cmd in queue.iter_mut() {
+                cmd.queued_at = Instant::now() - Duration::from_secs(120);
+            }
+        }
+
+        let _ = q.peek();
+        let snapshot = q.queue_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].display_name, "bazaar sell order");
+        assert!(q.has_bazaar_sell_order_for("coal"));
+    }
+
+    #[test]
+    fn has_bazaar_buy_order_detects_queued_and_running_item() {
+        let q = CommandQueue::new();
+        assert!(!q.has_bazaar_buy_order_for("coal"));
+
+        q.enqueue(dummy_bazaar_buy(), CommandPriority::Normal, true);
+        assert!(q.has_bazaar_buy_order_for("Coal"));
+
+        let _running = q.start_current();
+        assert!(q.has_bazaar_buy_order_for("coal"));
+
+        q.complete_current();
+        assert!(!q.has_bazaar_buy_order_for("coal"));
+    }
+
+    #[test]
+    fn remove_queued_sell_orders_for_item_keeps_running_command() {
+        let q = CommandQueue::new();
+        q.enqueue(dummy_bazaar_sell(), CommandPriority::Critical, true);
+        q.enqueue(
+            CommandType::BazaarSellOrder {
+                item_name: "Coal".into(),
+                item_tag: None,
+                amount: 32,
+                price_per_unit: 11.5,
+            },
+            CommandPriority::Critical,
+            true,
+        );
+        q.enqueue(dummy_bazaar_buy(), CommandPriority::Normal, true);
+
+        let _running = q.start_current();
+        let removed = q.remove_queued_bazaar_sell_orders_for("coal");
+
+        assert_eq!(removed, 1);
+        assert!(q.has_bazaar_sell_order_for("coal"));
+        assert_eq!(q.queue_snapshot().len(), 2);
     }
 }

@@ -2,4 +2,4 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/Quellcode"
-exec cargo run --bin frikadellen_baf
+exec cargo run --bin purse_pilot

@@ -463,8 +463,6 @@ dependencies = [
 [[package]]
 name = "azalea-inventory"
 version = "0.15.1+mc1.21.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f09ec45924b6f559398894b67d30aff7856f886dc3aa4f641dac738cfe3ce184"
 dependencies = [
  "azalea-auth",
  "azalea-buf",

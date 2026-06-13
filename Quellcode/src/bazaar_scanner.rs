@@ -396,6 +396,78 @@ pub fn should_reprice(
     }
 }
 
+pub fn should_reprice_sell(
+    order_age_seconds: u64,
+    seconds_since_last_reprice: Option<u64>,
+    reprices_this_hour: u64,
+    current_price_per_unit: f64,
+    fresh_price_per_unit: f64,
+    fifo_cost_basis_total: f64,
+    amount: u64,
+    config: &LocalBazaarScanConfig,
+) -> RepriceDecision {
+    if order_age_seconds < config.min_reprice_interval_seconds {
+        return RepriceDecision {
+            allowed: false,
+            reason: Some("ORDER_TOO_YOUNG"),
+        };
+    }
+    if let Some(elapsed) = seconds_since_last_reprice {
+        if elapsed < config.reprice_cooldown_seconds {
+            return RepriceDecision {
+                allowed: false,
+                reason: Some("REPRICE_COOLDOWN"),
+            };
+        }
+    }
+    if reprices_this_hour >= config.max_reprices_per_item_per_hour {
+        return RepriceDecision {
+            allowed: false,
+            reason: Some("TOO_MANY_REPRICES"),
+        };
+    }
+    if amount == 0 || fifo_cost_basis_total <= 0.0 || !fifo_cost_basis_total.is_finite() {
+        return RepriceDecision {
+            allowed: false,
+            reason: Some("UNKNOWN_COST_BASIS"),
+        };
+    }
+    if fresh_price_per_unit <= 0.0 || !fresh_price_per_unit.is_finite() {
+        return RepriceDecision {
+            allowed: false,
+            reason: Some("INVALID_SELL_PRICE"),
+        };
+    }
+    if fresh_price_per_unit >= current_price_per_unit {
+        return RepriceDecision {
+            allowed: false,
+            reason: Some("SELL_NOT_OVERPRICED"),
+        };
+    }
+
+    let total_price_movement = (current_price_per_unit - fresh_price_per_unit) * amount as f64;
+    if total_price_movement < config.min_reprice_profit_improvement.max(1.0) {
+        return RepriceDecision {
+            allowed: false,
+            reason: Some("LOW_SELL_PRICE_MOVEMENT"),
+        };
+    }
+
+    let tax_multiplier = 1.0 - (config.bazaar_tax_rate.max(0.0) / 100.0);
+    let fresh_after_tax = fresh_price_per_unit * amount as f64 * tax_multiplier;
+    if fresh_after_tax <= fifo_cost_basis_total {
+        return RepriceDecision {
+            allowed: false,
+            reason: Some("NEGATIVE_EXPECTED_PROFIT"),
+        };
+    }
+
+    RepriceDecision {
+        allowed: true,
+        reason: None,
+    }
+}
+
 pub async fn fetch_best_flips(
     config: &LocalBazaarScanConfig,
     limit: usize,
@@ -490,6 +562,10 @@ pub async fn fetch_best_flips(
         let q = product.quick_status;
         let is_classic = config.enable_classic_potato_book_flips
             && matches!(item_tag.as_str(), "HOT_POTATO_BOOK" | "FUMING_POTATO_BOOK");
+        if !is_local_order_search_supported(&item_tag) {
+            bump(&mut rejected, "UNSUPPORTED_PRODUCT_LOOKUP");
+            continue;
+        }
         if q.buy_price <= 0.0 || q.sell_price <= 0.0 {
             bump(&mut rejected, "INVALID_PRICE");
             continue;
@@ -1106,6 +1182,10 @@ pub async fn fetch_product_quotes() -> Result<HashMap<String, BazaarProductQuote
 }
 
 fn item_tag_to_name(tag: &str) -> String {
+    if let Some(name) = gemstone_tag_to_name(tag) {
+        return name;
+    }
+
     match tag {
         "FINE_AQUAMARINE_GEM" => return "Fine Aquamarine Gemstone".to_string(),
         "FINE_CITRINE_GEM" => return "Fine Citrine Gemstone".to_string(),
@@ -1144,12 +1224,38 @@ fn item_tag_to_name(tag: &str) -> String {
         "ROUGH_JASPER_GEM" => return "Rough Jasper Gemstone".to_string(),
         "ROUGH_AMETHYST_GEM" => return "Rough Amethyst Gemstone".to_string(),
         "WATER_LILY" => return "Lily Pad".to_string(),
+        "ENCHANTED_WATER_LILY" => return "Enchanted Lily Pad".to_string(),
         "RAW_FISH" => return "Raw Cod".to_string(),
         "SHARD_COD" => return "Cod Shard".to_string(),
         "SHARD_VORACIOUS_SPIDER" => return "Voracious Spider Shard".to_string(),
         _ => {}
     }
 
+    if let Some(essence) = tag.strip_prefix("ESSENCE_") {
+        return format!("{} Essence", title_case_tag(essence));
+    }
+
+    title_case_tag(tag)
+}
+
+fn gemstone_tag_to_name(tag: &str) -> Option<String> {
+    let mut parts = tag.split('_').collect::<Vec<_>>();
+    if parts.len() != 3 || parts.pop()? != "GEM" {
+        return None;
+    }
+    let gem = parts.pop()?;
+    let tier = parts.pop()?;
+    if !matches!(tier, "ROUGH" | "FLAWED" | "FINE" | "FLAWLESS" | "PERFECT") {
+        return None;
+    }
+    Some(format!(
+        "{} {} Gemstone",
+        title_case_tag(tier),
+        title_case_tag(gem)
+    ))
+}
+
+fn title_case_tag(tag: &str) -> String {
     tag.split('_')
         .filter(|part| !part.is_empty())
         .map(|part| {
@@ -1167,6 +1273,10 @@ fn item_tag_to_name(tag: &str) -> String {
         .join(" ")
 }
 
+fn is_local_order_search_supported(tag: &str) -> bool {
+    !tag.starts_with("ENCHANTMENT_") && !tag.starts_with("ESSENCE_")
+}
+
 #[cfg(test)]
 mod tests {
     use super::item_tag_to_name;
@@ -1177,6 +1287,30 @@ mod tests {
             item_tag_to_name("ENCHANTED_COAL_BLOCK"),
             "Enchanted Coal Block"
         );
+        assert_eq!(
+            item_tag_to_name("ENCHANTED_WATER_LILY"),
+            "Enchanted Lily Pad"
+        );
+        assert_eq!(
+            item_tag_to_name("FLAWLESS_AMBER_GEM"),
+            "Flawless Amber Gemstone"
+        );
+        assert_eq!(item_tag_to_name("FLAWED_JADE_GEM"), "Flawed Jade Gemstone");
+    }
+
+    #[test]
+    fn formats_essence_tags_for_visible_bazaar_search() {
+        assert_eq!(item_tag_to_name("ESSENCE_UNDEAD"), "Undead Essence");
+        assert_eq!(item_tag_to_name("ESSENCE_WITHER"), "Wither Essence");
+    }
+
+    #[test]
+    fn rejects_enchantment_products_for_local_buy_search_until_mapped() {
+        assert!(!super::is_local_order_search_supported(
+            "ENCHANTMENT_FEAST_1"
+        ));
+        assert!(!super::is_local_order_search_supported("ESSENCE_UNDEAD"));
+        assert!(super::is_local_order_search_supported("SUMMONING_EYE"));
     }
 }
 
@@ -1310,5 +1444,69 @@ mod practical_tests {
             Some("LOW_REPRICE_IMPROVEMENT")
         );
         assert!(should_reprice(300, Some(400), 0, 100_000.0, 200_000.0, false, &cfg).allowed);
+    }
+
+    #[test]
+    fn sell_reprice_requires_fifo_positive_lower_price() {
+        let cfg = test_config();
+        assert_eq!(
+            should_reprice_sell(60, None, 0, 1_200_000.0, 1_100_000.0, 2_000_000.0, 2, &cfg).reason,
+            Some("ORDER_TOO_YOUNG")
+        );
+        assert_eq!(
+            should_reprice_sell(
+                300,
+                Some(400),
+                0,
+                1_200_000.0,
+                1_190_000.0,
+                2_000_000.0,
+                2,
+                &cfg
+            )
+            .reason,
+            Some("LOW_SELL_PRICE_MOVEMENT")
+        );
+        assert_eq!(
+            should_reprice_sell(
+                300,
+                Some(400),
+                0,
+                1_200_000.0,
+                980_000.0,
+                1_970_000.0,
+                2,
+                &cfg
+            )
+            .reason,
+            Some("NEGATIVE_EXPECTED_PROFIT")
+        );
+        assert_eq!(
+            should_reprice_sell(
+                300,
+                Some(400),
+                0,
+                1_200_000.0,
+                1_250_000.0,
+                2_000_000.0,
+                2,
+                &cfg
+            )
+            .reason,
+            Some("SELL_NOT_OVERPRICED")
+        );
+        assert!(
+            should_reprice_sell(
+                300,
+                Some(400),
+                0,
+                1_200_000.0,
+                1_100_000.0,
+                2_000_000.0,
+                2,
+                &cfg
+            )
+            .allowed
+        );
     }
 }

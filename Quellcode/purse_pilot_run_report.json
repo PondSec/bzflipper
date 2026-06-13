@@ -1,0 +1,154 @@
+{
+  "generated_at": "2026-06-12T08:26:37+02:00",
+  "run_type": "live_debug_followup_after_1h_observation",
+  "configured_total_capital": 60000000,
+  "current_process": {
+    "realized_fifo_profit_total": 96443,
+    "realized_profit_per_hour": 8863.793719683432,
+    "uptime_seconds": 39170
+  },
+  "live_flow_state": {
+    "open_buy_capital": 13501718.7,
+    "open_sell_value": 6063213.788405122,
+    "remaining_cost_lot_value": 5582879.899999999,
+    "active_buy_orders": 5,
+    "active_sell_orders": 5,
+    "stale_buy_orders": 0,
+    "stale_sell_orders": 0,
+    "items_waiting_for_sell": [],
+    "unknown_cost_basis_sell_total_count": 0,
+    "estimated_unrealized_profit": 404543.7160500586
+  },
+  "diagnostics": {
+    "target_profit_per_hour": 5000000.0,
+    "actual_realized_profit_per_hour": 8863.793719683432,
+    "realized_fifo_profit_total": 96443,
+    "main_bottleneck": "BUY_FILL_TOO_SLOW",
+    "secondary_bottlenecks": [
+      "WAITING_FOR_SELL_FILL",
+      "PRODUCT_LOOKUP_FAILURES"
+    ],
+    "recommended_changes": {
+      "exclude_recent_product_lookup_failures": true,
+      "local_bazaar_min_sell_volume": 48400,
+      "local_bazaar_stale_buy_max_age_seconds": 660
+    },
+    "average_capital_locked": 25147812.388405122,
+    "capital_turnover_score": 0.0003524677845843264,
+    "open_buy_capital": 13501718.7,
+    "open_sell_value": 6063213.788405122,
+    "cost_lot_value": 5582879.899999999,
+    "active_buy_orders": 5,
+    "active_sell_orders": 5,
+    "stale_buy_orders": 0,
+    "stale_sell_orders": 0,
+    "sell_queue_length": 0,
+    "sell_queue_blocked_count": 0,
+    "sell_queue_last_action": "IDLE",
+    "sell_queue_last_block_reason": null,
+    "unknown_cost_basis_count": 0,
+    "ignored_legacy_profit_total": 3085200
+  },
+  "active_orders": [
+    {
+      "item_name": "Carrot Zest",
+      "amount": 2,
+      "price_per_unit": 618010.486585366,
+      "is_buy_order": false,
+      "status": "open",
+      "placed_at": 1781244793
+    },
+    {
+      "item_name": "Melon Juice",
+      "amount": 21,
+      "price_per_unit": 163659.9,
+      "is_buy_order": true,
+      "status": "open",
+      "placed_at": 1781245065
+    },
+    {
+      "item_name": "Refined Tungsten",
+      "amount": 1,
+      "price_per_unit": 2640007.3,
+      "is_buy_order": true,
+      "status": "open",
+      "placed_at": 1781245070
+    },
+    {
+      "item_name": "Flawless Sapphire Gemstone",
+      "amount": 1,
+      "price_per_unit": 2718724.5,
+      "is_buy_order": true,
+      "status": "open",
+      "placed_at": 1781245074
+    },
+    {
+      "item_name": "Carrot Zest",
+      "amount": 2,
+      "price_per_unit": 618010.4594262296,
+      "is_buy_order": false,
+      "status": "open",
+      "placed_at": 1781245179
+    },
+    {
+      "item_name": "Suspicious Scrap",
+      "amount": 1,
+      "price_per_unit": 208057.6260115607,
+      "is_buy_order": false,
+      "status": "open",
+      "placed_at": 1781245252
+    },
+    {
+      "item_name": "Summoning Eye",
+      "amount": 2,
+      "price_per_unit": 1675945.3851851851,
+      "is_buy_order": false,
+      "status": "open",
+      "placed_at": 1781245326
+    },
+    {
+      "item_name": "Glossy Gemstone",
+      "amount": 1,
+      "price_per_unit": 1804727.8,
+      "is_buy_order": true,
+      "status": "open",
+      "placed_at": 1781245379
+    },
+    {
+      "item_name": "Kismet Feather",
+      "amount": 2,
+      "price_per_unit": 1450700.6,
+      "is_buy_order": true,
+      "status": "open",
+      "placed_at": 1781245440
+    },
+    {
+      "item_name": "Enchanted Lily Pad",
+      "amount": 1,
+      "price_per_unit": 31223.5,
+      "is_buy_order": false,
+      "status": "open",
+      "placed_at": 1781245498
+    }
+  ],
+  "observed_fix_validation": {
+    "old_failure": "BUYs stopped while bounded active SELLs were open; profit flow stalled waiting for sell fill",
+    "applied_fix": "bounded active SELLs no longer freeze BUY scan; SELL queue still hard-blocks new unrelated BUYs until covered",
+    "followup_result": "sell_queue_length cleared from 1 to 0 by minute 1; BUY side stayed active under 60M cap; a new Enchanted Lily Pad BUY transitioned to SELL by minute 5"
+  },
+  "acceptance_checks": {
+    "fifo_known_cost_sell_claims_only": true,
+    "legacy_coflnet_profit_ignored_in_bz_total": true,
+    "unknown_cost_basis_not_counted": true,
+    "negative_fifo_sells_blocked": true,
+    "sell_queue_prioritized": true,
+    "open_buy_capital_cap_respected": true,
+    "remaining_cost_lot_value_bounded": true,
+    "diagnostics_explains_target_gap": true
+  },
+  "recommended_next_config": {
+    "exclude_recent_product_lookup_failures": true,
+    "local_bazaar_min_sell_volume": 48400,
+    "local_bazaar_stale_buy_max_age_seconds": 660
+  }
+}

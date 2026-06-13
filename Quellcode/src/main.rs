@@ -13,6 +13,7 @@ use purse_pilot::{
 use rustyline;
 use serde_json;
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -138,6 +139,34 @@ fn profit_per_hour_from_points(points: &[(u64, i64)]) -> i64 {
     (((latest.1 - baseline.1) as f64) * 3600.0 / elapsed as f64).round() as i64
 }
 
+fn should_hold_buy_scan_for_sell_rotation(
+    active_sell_count: usize,
+    remaining_cost_lot_value: f64,
+    open_sell_value: f64,
+    total_capital: u64,
+    max_cost_lot_capital_ratio: f64,
+    max_concurrent_buy_orders: usize,
+    max_pending_buy_stacks: u64,
+) -> bool {
+    let total_capital = total_capital.max(1) as f64;
+    let max_cost_lot_value = total_capital * max_cost_lot_capital_ratio.clamp(0.05, 1.0);
+    if remaining_cost_lot_value >= max_cost_lot_value {
+        return true;
+    }
+    let sell_side_locked = remaining_cost_lot_value.max(0.0) + open_sell_value.max(0.0);
+    let max_sell_side_locked =
+        total_capital * (max_cost_lot_capital_ratio.clamp(0.05, 0.50) * 1.60).clamp(0.25, 0.60);
+    if sell_side_locked >= max_sell_side_locked {
+        return true;
+    }
+
+    let hard_sell_order_limit = (max_pending_buy_stacks as usize)
+        .saturating_mul(2)
+        .max(max_concurrent_buy_orders.saturating_add(2))
+        .max(4);
+    active_sell_count >= hard_sell_order_limit
+}
+
 fn count_cached_inventory_bazaar_items(
     inventory_json: &str,
     bazaar_quotes: &HashMap<String, purse_pilot::bazaar_scanner::BazaarProductQuote>,
@@ -193,6 +222,307 @@ fn count_cached_inventory_bazaar_items(
         .into_iter()
         .map(|(tag, (name, count))| (tag, name, count))
         .collect()
+}
+
+fn cached_inventory_bazaar_count_map(
+    inventory_json: &str,
+    bazaar_quotes: &HashMap<String, purse_pilot::bazaar_scanner::BazaarProductQuote>,
+) -> HashMap<String, u64> {
+    let mut counts = HashMap::new();
+    for (tag, display_name, amount) in
+        count_cached_inventory_bazaar_items(inventory_json, bazaar_quotes)
+    {
+        let display_key = purse_pilot::bazaar_tracker::normalize_for_match_pub(&display_name);
+        *counts.entry(display_key).or_insert(0) += amount;
+        if let Some(quote) = bazaar_quotes.get(&tag) {
+            let quote_key = purse_pilot::bazaar_tracker::normalize_for_match_pub(&quote.item_name);
+            if quote_key != purse_pilot::bazaar_tracker::normalize_for_match_pub(&display_name) {
+                *counts.entry(quote_key).or_insert(0) += amount;
+            }
+        }
+    }
+    counts
+}
+
+fn find_bazaar_quote_for_item<'a>(
+    item_name: &str,
+    item_tag: Option<&str>,
+    bazaar_quotes: &'a HashMap<String, purse_pilot::bazaar_scanner::BazaarProductQuote>,
+) -> Option<&'a purse_pilot::bazaar_scanner::BazaarProductQuote> {
+    if let Some(tag) = item_tag {
+        if let Some(quote) = bazaar_quotes.get(tag) {
+            return Some(quote);
+        }
+    }
+    let normalized = purse_pilot::bazaar_tracker::normalize_for_match_pub(item_name);
+    bazaar_quotes.values().find(|quote| {
+        purse_pilot::bazaar_tracker::normalize_for_match_pub(&quote.item_name) == normalized
+    })
+}
+
+fn should_consolidate_sell_orders(
+    total_cost_lot_amount: u64,
+    active_sell_amount: u64,
+    active_sell_order_count: usize,
+) -> bool {
+    active_sell_order_count > 1
+        || (active_sell_order_count > 0 && active_sell_amount < total_cost_lot_amount)
+}
+
+fn apply_live_capital_blocker_cooldowns(
+    snapshot: &purse_pilot::bazaar_tracker::BazaarProfitAuditSnapshot,
+    bazaar_tracker: &purse_pilot::bazaar_tracker::BazaarOrderTracker,
+    per_item_exposure_cap: u64,
+) -> usize {
+    let exposure_cap = (per_item_exposure_cap.max(1_000_000)) as f64;
+    let mut applied = 0usize;
+    for perf in snapshot.item_performance.values() {
+        let locked_capital = perf.current_cost_lot_value.max(0.0)
+            + perf.current_open_sell_value.max(0.0)
+            + perf.current_open_buy_capital.max(0.0);
+        if locked_capital <= 0.0 {
+            continue;
+        }
+        let no_recent_realized_profit =
+            perf.realized_profit_last_10m <= 0 && perf.realized_profit_last_30m <= 0;
+        let (reason, cooldown_seconds) = if perf.current_open_sell_value > 0.0
+            && perf.current_cost_lot_value <= 1.0
+        {
+            ("UNKNOWN_COST_BASIS", 1_800)
+        } else if perf.current_cost_lot_value > exposure_cap && perf.max_cost_lot_age_seconds >= 600
+        {
+            ("CAPITAL_BLOCKER", 1_800)
+        } else if perf.current_open_sell_value + perf.current_cost_lot_value > exposure_cap * 1.5
+            && perf.max_cost_lot_age_seconds >= 1_200
+            && no_recent_realized_profit
+        {
+            ("SELL_TOO_SLOW", 1_800)
+        } else if perf.current_cost_lot_value > exposure_cap * 0.65
+            && perf.max_cost_lot_age_seconds >= 1_800
+            && no_recent_realized_profit
+        {
+            ("BAD_TURNOVER", 1_800)
+        } else {
+            continue;
+        };
+
+        if bazaar_tracker
+            .item_cooldown_reason(&perf.item_name)
+            .is_none()
+        {
+            warn!(
+                "[BAF][ITEM_COOLDOWN] item={} reason={} locked_capital={:.0} cost_lots={:.0} open_sell={:.0} open_buy={:.0} max_cost_lot_age={}s action=apply_live_capital_blocker_cooldown",
+                perf.item_name,
+                reason,
+                locked_capital,
+                perf.current_cost_lot_value,
+                perf.current_open_sell_value,
+                perf.current_open_buy_capital,
+                perf.max_cost_lot_age_seconds
+            );
+            bazaar_tracker.cooldown_item(&perf.item_name, reason, cooldown_seconds);
+            applied += 1;
+        }
+    }
+    applied
+}
+
+fn queue_missing_sell_orders_for_cost_lots(
+    snapshot: &purse_pilot::bazaar_tracker::BazaarProfitAuditSnapshot,
+    bazaar_quotes: &HashMap<String, purse_pilot::bazaar_scanner::BazaarProductQuote>,
+    inventory_counts: Option<&HashMap<String, u64>>,
+    bazaar_tracker: &purse_pilot::bazaar_tracker::BazaarOrderTracker,
+    command_queue: &CommandQueue,
+    chat_tx: &broadcast::Sender<String>,
+    bazaar_tax_rate: f64,
+    price_undercut: f64,
+) -> usize {
+    let mut queued = 0usize;
+    for waiting_item in &snapshot.items_waiting_for_sell {
+        let mut total_cost_lot_amount = bazaar_tracker.remaining_cost_lot_amount_for(waiting_item);
+        let active_sell_amount = bazaar_tracker.active_sell_amount_for(waiting_item);
+        let active_sell_order_count = bazaar_tracker.active_sell_order_count_for(waiting_item);
+        let planned_sell_amount = bazaar_tracker
+            .planned_local_sell_amount(waiting_item)
+            .unwrap_or(0);
+        let protected_sell_amount = active_sell_amount.max(planned_sell_amount);
+        let mut uncovered_cost_lot_amount =
+            total_cost_lot_amount.saturating_sub(active_sell_amount);
+        if total_cost_lot_amount == 0 {
+            warn!(
+                "[BAF][LIFECYCLE] Cannot place missing SELL for {} — no FIFO lot amount",
+                waiting_item
+            );
+            continue;
+        }
+        if uncovered_cost_lot_amount > 0 {
+            if let Some(counts) = inventory_counts {
+                let observed_inventory_amount = counts
+                    .get(&purse_pilot::bazaar_tracker::normalize_for_match_pub(
+                        waiting_item,
+                    ))
+                    .copied()
+                    .unwrap_or(0);
+                if observed_inventory_amount < uncovered_cost_lot_amount {
+                    warn!(
+                        "[BAF][LIFECYCLE] Missing SELL blocked for {} — uncovered FIFO amount {} of total {} but inventory has {}",
+                        waiting_item,
+                        uncovered_cost_lot_amount,
+                        total_cost_lot_amount,
+                        observed_inventory_amount
+                    );
+                    let keep_amount =
+                        protected_sell_amount.saturating_add(observed_inventory_amount);
+                    bazaar_tracker.mark_cost_lot_excess_missing_from_inventory(
+                        waiting_item,
+                        keep_amount,
+                        observed_inventory_amount,
+                    );
+                    total_cost_lot_amount =
+                        bazaar_tracker.remaining_cost_lot_amount_for(waiting_item);
+                    uncovered_cost_lot_amount =
+                        total_cost_lot_amount.saturating_sub(active_sell_amount);
+                    if observed_inventory_amount == 0 || uncovered_cost_lot_amount == 0 {
+                        if planned_sell_amount > 0 && active_sell_amount == 0 {
+                            warn!(
+                                "[BAF][SELL_ESCROW_GUARD] item={} preserved FIFO lot while planned SELL amount {} is unresolved; forcing ManageOrders before BUY",
+                                waiting_item, planned_sell_amount
+                            );
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+        if should_consolidate_sell_orders(
+            total_cost_lot_amount,
+            active_sell_amount,
+            active_sell_order_count,
+        ) {
+            let removed_queued = command_queue.remove_queued_bazaar_sell_orders_for(waiting_item);
+            warn!(
+                "[BAF][SELL_CONSOLIDATE] item={} active_sell_orders={} active_sell_amount={} fifo_amount={} uncovered_amount={} removed_queued_sells={} action=cancel_existing_sell_before_combined_relist",
+                waiting_item,
+                active_sell_order_count,
+                active_sell_amount,
+                total_cost_lot_amount,
+                uncovered_cost_lot_amount,
+                removed_queued
+            );
+            if !command_queue.has_manage_orders() {
+                command_queue.enqueue(
+                    purse_pilot::types::CommandType::ManageOrders {
+                        cancel_open: false,
+                        target_item: Some((waiting_item.clone(), false)),
+                    },
+                    purse_pilot::types::CommandPriority::Critical,
+                    false,
+                );
+            }
+            queued += 1;
+            continue;
+        }
+        if command_queue.has_bazaar_sell_order_for(waiting_item) {
+            info!(
+                "[BAF][LIFECYCLE] SELL already queued for waiting CostLot item={}",
+                waiting_item
+            );
+            continue;
+        }
+        if uncovered_cost_lot_amount == 0 {
+            info!(
+                "[BAF][LIFECYCLE] Waiting CostLot item={} is already covered by active SELL amount {}",
+                waiting_item, active_sell_amount
+            );
+            continue;
+        }
+        let total_cost_lot_amount = bazaar_tracker.remaining_cost_lot_amount_for(waiting_item);
+        let cost_lot_value = bazaar_tracker.remaining_cost_lot_value_for(waiting_item);
+        let cost_basis_per_unit = cost_lot_value / total_cost_lot_amount.max(1) as f64;
+
+        let planned = bazaar_tracker.planned_local_sell(waiting_item);
+        let planned_tag = planned
+            .as_ref()
+            .and_then(|(_, tag, _)| tag.as_deref())
+            .filter(|tag| !tag.is_empty());
+        let quote = find_bazaar_quote_for_item(waiting_item, planned_tag, bazaar_quotes);
+        let item_name = quote
+            .map(|q| q.item_name.clone())
+            .unwrap_or_else(|| waiting_item.clone());
+        let item_tag = planned
+            .as_ref()
+            .and_then(|(_, tag, _)| tag.clone())
+            .or_else(|| quote.map(|q| q.item_tag.clone()));
+        let sell_price = planned
+            .as_ref()
+            .map(|(price, _, _)| *price)
+            .filter(|price| *price > 0.0)
+            .or_else(|| quote.map(|q| (q.buy_price - price_undercut.max(0.0)).max(0.0)))
+            .unwrap_or(0.0);
+
+        if sell_price <= 0.0 {
+            warn!(
+                "[BAF][LIFECYCLE] Cannot place missing SELL for {} — no usable live quote or planned price",
+                waiting_item
+            );
+            continue;
+        }
+
+        let sell_check = bazaar_tracker.validate_sell_before_order(
+            &item_name,
+            uncovered_cost_lot_amount,
+            sell_price,
+            bazaar_tax_rate,
+        );
+        if !sell_check.allowed {
+            warn!(
+                "[BAF][LIFECYCLE] Missing SELL blocked item={} amount={} sell_price={:.1} expected_after_tax={:.1} fifo_cost={:.1} avg_cost={:.1} reason={}",
+                item_name,
+                uncovered_cost_lot_amount,
+                sell_price,
+                sell_check.expected_sell_after_tax,
+                sell_check.fifo_cost_basis_total,
+                cost_basis_per_unit,
+                sell_check.reason.as_ref().map(|r| r.as_str()).unwrap_or("UNKNOWN")
+            );
+            continue;
+        }
+
+        bazaar_tracker.record_planned_local_sell_amount(
+            &item_name,
+            sell_price,
+            item_tag.clone(),
+            uncovered_cost_lot_amount,
+        );
+        command_queue.enqueue(
+            purse_pilot::types::CommandType::BazaarSellOrder {
+                item_name: item_name.clone(),
+                item_tag,
+                amount: uncovered_cost_lot_amount,
+                price_per_unit: sell_price,
+            },
+            purse_pilot::types::CommandPriority::Critical,
+            false,
+        );
+        info!(
+            "[BAF][LIFECYCLE] Queued missing SELL from FIFO CostLots item={} amount={} total_lots={} active_sell_amount={} price={:.1}",
+            item_name,
+            uncovered_cost_lot_amount,
+            total_cost_lot_amount,
+            active_sell_amount,
+            sell_price
+        );
+        let msg = format!(
+            "§f[§4PursePilot§f]: §6[Local BZ] lifecycle SELL §r{} §7x{} @ §6{}§7",
+            item_name,
+            uncovered_cost_lot_amount,
+            format_coins_f64(sell_price)
+        );
+        print_mc_chat(&msg);
+        let _ = chat_tx.send(msg);
+        queued += 1;
+    }
+    queued
 }
 
 fn is_ban_disconnect(reason: &str) -> bool {
@@ -1062,6 +1392,7 @@ async fn main() -> Result<()> {
     let last_auction_listed_at_events = last_auction_listed_at.clone();
     let session_start = std::time::Instant::now();
     let prev_secs_events = previous_session_secs;
+    let print_chat_to_console = std::io::stdin().is_terminal();
     tokio::spawn(async move {
         while let Some(event) = bot_client_clone.next_event().await {
             match event {
@@ -1073,7 +1404,9 @@ async fn main() -> Result<()> {
                 }
                 purse_pilot::bot::BotEvent::ChatMessage(msg) => {
                     // Print Minecraft chat with color codes converted to ANSI
-                    print_mc_chat(&msg);
+                    if print_chat_to_console {
+                        print_mc_chat(&msg);
+                    }
                     // Broadcast to web panel clients
                     let _ = chat_tx_events.send(msg.clone());
 
@@ -1242,16 +1575,15 @@ async fn main() -> Result<()> {
                 }
                 purse_pilot::bot::BotEvent::StartupComplete { orders_cancelled } => {
                     info!("[Startup] Startup complete - bot is ready to flip! ({} order(s) cancelled)", orders_cancelled);
-                    // Clear the bazaar order tracker for a clean slate — the startup
-                    // ManageOrders cycle cancelled all in-game orders already.
-                    {
-                        let removed = bazaar_tracker_events.clear_all_orders();
-                        if removed > 0 {
-                            info!(
-                                "[Startup] Cleared {} stale order(s) from bazaar tracker",
-                                removed
-                            );
-                        }
+                    // Startup ManageOrders runs in collect-only mode, so open
+                    // in-game orders remain live. Preserve tracked timestamps;
+                    // clearing here makes old BUY orders look fresh and delays
+                    // stale-order pressure handling.
+                    if orders_cancelled > 0 {
+                        info!(
+                            "[Startup] {} order(s) were cancelled during startup; tracker reconciliation will remove any stale entries",
+                            orders_cancelled
+                        );
                     }
                     // Also clear the auction slot blocked flag on startup
                     bot_client_clone.clear_auction_slot_blocked();
@@ -1723,6 +2055,18 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
+                purse_pilot::bot::BotEvent::BazaarOrderFailed {
+                    item_name,
+                    is_buy_order,
+                    reason,
+                } => {
+                    bazaar_tracker_events.record_product_lookup_failed(&item_name, &reason);
+                    let side = if is_buy_order { "BUY" } else { "SELL" };
+                    warn!(
+                        "[BAF][ORDER_FAILED] side={} item={} reason={} action=cooldown",
+                        side, item_name, reason
+                    );
+                }
                 purse_pilot::bot::BotEvent::AuctionListed {
                     item_name,
                     starting_bid,
@@ -1790,14 +2134,38 @@ async fn main() -> Result<()> {
                     is_buy_order,
                     claimed_amount,
                 } => {
-                    // Remove from tracker.
-                    let order_data = bazaar_tracker_events.remove_order(&item_name, is_buy_order);
+                    // Remove only the collected portion from the tracker. Partial Bazaar
+                    // claims keep the unfilled remainder open in-game and must keep
+                    // counting as locked capital.
+                    let order_data = bazaar_tracker_events.remove_or_reduce_order_on_collect(
+                        &item_name,
+                        is_buy_order,
+                        claimed_amount,
+                    );
                     // Determine the actual quantity collected.  `claimed_amount` is
                     // parsed from the "Filled: X/Y" lore in the Manage Orders window.
                     // Fall back to the tracker's original order amount when unavailable.
-                    let actual_amount = claimed_amount
-                        .or_else(|| order_data.as_ref().map(|o| o.amount))
+                    let raw_actual_amount = order_data
+                        .as_ref()
+                        .map(|o| o.amount)
+                        .or(claimed_amount)
                         .unwrap_or(0);
+                    let actual_amount = if !is_buy_order {
+                        if let Some(ref order) = order_data {
+                            let capped = raw_actual_amount.min(order.amount);
+                            if raw_actual_amount > order.amount {
+                                warn!(
+                                    "[BAF][SELL_AMOUNT_CAPPED_TO_TRACKED_FIFO] item={} claimed_amount={} tracked_sell_amount={} action=count_known_fifo_only",
+                                    item_name, raw_actual_amount, order.amount
+                                );
+                            }
+                            capped
+                        } else {
+                            raw_actual_amount
+                        }
+                    } else {
+                        raw_actual_amount
+                    };
                     if let Some(ref order) = order_data {
                         // Store buy cost so we can compute profit when the sell offer is collected.
                         // BUY collections do NOT record profit — profit is only realized on SELL.
@@ -1814,7 +2182,7 @@ async fn main() -> Result<()> {
                                 item_name, actual_amount, order.price_per_unit
                             );
                             if actual_amount > 0 {
-                                if let Some((sell_price_per_unit, _item_tag)) =
+                                if let Some((sell_price_per_unit, item_tag)) =
                                     bazaar_tracker_events.take_planned_local_sell(&item_name)
                                 {
                                     if bot_client_clone.is_bazaar_daily_limit() {
@@ -1823,6 +2191,42 @@ async fn main() -> Result<()> {
                                             item_name
                                         );
                                     } else {
+                                        let active_sell_amount = bazaar_tracker_events
+                                            .active_sell_amount_for(&item_name);
+                                        let active_sell_order_count = bazaar_tracker_events
+                                            .active_sell_order_count_for(&item_name);
+                                        if active_sell_amount > 0 || active_sell_order_count > 0 {
+                                            bazaar_tracker_events.record_planned_local_sell_amount(
+                                                &item_name,
+                                                sell_price_per_unit,
+                                                item_tag.clone(),
+                                                actual_amount,
+                                            );
+                                            let removed_queued = command_queue_clone
+                                                .remove_queued_bazaar_sell_orders_for(&item_name);
+                                            warn!(
+                                                "[BAF][SELL_CONSOLIDATE] BUY collected item={} amount={} active_sell_orders={} active_sell_amount={} removed_queued_sells={} action=defer_new_sell_until_existing_sell_is_consolidated",
+                                                item_name,
+                                                actual_amount,
+                                                active_sell_order_count,
+                                                active_sell_amount,
+                                                removed_queued
+                                            );
+                                            if !command_queue_clone.has_manage_orders() {
+                                                command_queue_clone.enqueue(
+                                                    purse_pilot::types::CommandType::ManageOrders {
+                                                        cancel_open: false,
+                                                        target_item: Some((
+                                                            item_name.clone(),
+                                                            false,
+                                                        )),
+                                                    },
+                                                    purse_pilot::types::CommandPriority::Critical,
+                                                    false,
+                                                );
+                                            }
+                                            continue;
+                                        }
                                         info!(
                                             "[LocalBazaar] BUY collected for {} — queueing SELL {}x @ {:.1}",
                                             item_name, actual_amount, sell_price_per_unit
@@ -1838,13 +2242,13 @@ async fn main() -> Result<()> {
                                         bazaar_tracker_events.record_planned_local_sell_amount(
                                             &item_name,
                                             sell_price_per_unit,
-                                            None,
+                                            item_tag.clone(),
                                             actual_amount,
                                         );
                                         command_queue_clone.enqueue(
                                             purse_pilot::types::CommandType::BazaarSellOrder {
                                                 item_name: item_name.clone(),
-                                                item_tag: None,
+                                                item_tag,
                                                 amount: actual_amount,
                                                 price_per_unit: sell_price_per_unit,
                                             },
@@ -1888,6 +2292,7 @@ async fn main() -> Result<()> {
                             if matches!(
                                 audit.cost_basis_status,
                                 purse_pilot::bazaar_tracker::CostBasisStatus::Known
+                                    | purse_pilot::bazaar_tracker::CostBasisStatus::PartialKnownCostBasis
                             ) {
                                 profit_tracker_events.record_bz_profit(audit.realized_profit);
                                 Some(audit.realized_profit)
@@ -2046,7 +2451,7 @@ async fn main() -> Result<()> {
                     // remove_order again would incorrectly remove a DIFFERENT
                     // same-item order.
                     let order_data = if !already_collected {
-                        bazaar_tracker_events.remove_order(&item_name, is_buy_order)
+                        bazaar_tracker_events.remove_oldest_order(&item_name, is_buy_order)
                     } else {
                         None
                     };
@@ -2199,6 +2604,9 @@ async fn main() -> Result<()> {
             }
         }
     });
+    if !print_chat_to_console {
+        info!("Minecraft chat console output disabled — stdin is not an interactive terminal");
+    }
 
     // Spawn WebSocket message handler
     let command_queue_clone = command_queue.clone();
@@ -3258,19 +3666,33 @@ async fn main() -> Result<()> {
                 // sending chat commands (e.g. /ah, /bz) while still in the lobby.
                 if bot_client_clone.is_startup_in_progress() {
                     let is_startup_cmd = matches!(
-                        cmd.command_type,
+                        &cmd.command_type,
                         purse_pilot::types::CommandType::CheckCookie
                             | purse_pilot::types::CommandType::ManageOrders { .. }
                             | purse_pilot::types::CommandType::ClaimSoldItem
                             | purse_pilot::types::CommandType::ClaimPurchasedItem
+                    ) || matches!(
+                        &cmd.command_type,
+                        purse_pilot::types::CommandType::SendChat { message }
+                            if matches!(message.as_str(), "/play sb" | "/is" | "/lobby")
                     );
                     if !is_startup_cmd {
                         debug!(
                             "[Queue] Deferring non-startup command during startup: {:?}",
                             cmd.command_type
                         );
+                        if matches!(
+                            cmd.command_type,
+                            purse_pilot::types::CommandType::BazaarSellOrder { .. }
+                        ) {
+                            command_queue_processor.enqueue(
+                                cmd.command_type.clone(),
+                                purse_pilot::types::CommandPriority::High,
+                                cmd.interruptible,
+                            );
+                        }
                         command_queue_processor.complete_current();
-                        sleep(Duration::from_millis(250)).await;
+                        sleep(Duration::from_secs(1)).await;
                         continue;
                     }
                 }
@@ -3530,164 +3952,168 @@ async fn main() -> Result<()> {
     // The state will transition from Startup -> Idle after initialization
     info!("BAF initialization started - waiting for bot to complete setup...");
 
-    // Set up console input handler for commands
-    info!("Console interface ready - type commands and press Enter:");
-    info!("  /cofl <command> - Send command to COFL websocket");
-    info!("  /<command> - Send command to Minecraft");
-    info!("  <text> - Send chat message to COFL websocket");
+    if config.enable_console_input && std::io::stdin().is_terminal() {
+        // Set up console input handler for commands
+        info!("Console interface ready - type commands and press Enter:");
+        info!("  /cofl <command> - Send command to COFL websocket");
+        info!("  /<command> - Send command to Minecraft");
+        info!("  <text> - Send chat message to COFL websocket");
 
-    // Spawn console input handler
-    let ws_client_for_console = ws_client.clone();
-    let command_queue_for_console = command_queue.clone();
+        // Spawn console input handler
+        let ws_client_for_console = ws_client.clone();
+        let command_queue_for_console = command_queue.clone();
 
-    tokio::spawn(async move {
-        // Rustyline provides readline with history (up/down arrow key navigation) and
-        // proper terminal handling. Since it's a blocking API we drive it in a
-        // dedicated blocking task and send each line over an mpsc channel.
-        let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        tokio::task::spawn_blocking(move || {
-            let mut rl = match rustyline::DefaultEditor::new() {
-                Ok(ed) => ed,
-                Err(e) => {
-                    eprintln!("[Console] Failed to initialize readline: {}", e);
-                    return;
-                }
-            };
-            loop {
-                match rl.readline("") {
-                    Ok(line) => {
-                        let _ = rl.add_history_entry(line.as_str());
-                        if line_tx.send(line).is_err() {
+        tokio::spawn(async move {
+            // Rustyline provides readline with history (up/down arrow key navigation) and
+            // proper terminal handling. Since it's a blocking API we drive it in a
+            // dedicated blocking task and send each line over an mpsc channel.
+            let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            tokio::task::spawn_blocking(move || {
+                let mut rl = match rustyline::DefaultEditor::new() {
+                    Ok(ed) => ed,
+                    Err(e) => {
+                        eprintln!("[Console] Failed to initialize readline: {}", e);
+                        return;
+                    }
+                };
+                loop {
+                    match rl.readline("") {
+                        Ok(line) => {
+                            let _ = rl.add_history_entry(line.as_str());
+                            if line_tx.send(line).is_err() {
+                                break;
+                            }
+                        }
+                        Err(rustyline::error::ReadlineError::Interrupted) => {
+                            // Ctrl-C in readline: forward as a shutdown signal
+                            let _ = line_tx.send("__SHUTDOWN__".to_string());
+                            break;
+                        }
+                        Err(rustyline::error::ReadlineError::Eof) => {
+                            // Ctrl-D / end of stdin
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("[Console] Readline error: {}", e);
                             break;
                         }
                     }
-                    Err(rustyline::error::ReadlineError::Interrupted) => {
-                        // Ctrl-C in readline: forward as a shutdown signal
-                        let _ = line_tx.send("__SHUTDOWN__".to_string());
-                        break;
-                    }
-                    Err(rustyline::error::ReadlineError::Eof) => {
-                        // Ctrl-D / end of stdin
-                        break;
-                    }
-                    Err(e) => {
-                        eprintln!("[Console] Readline error: {}", e);
-                        break;
+                }
+            });
+
+            while let Some(line) = line_rx.recv().await {
+                let input = line.trim();
+                if input == "__SHUTDOWN__" {
+                    info!("Received Ctrl+C — shutting down BAF...");
+                    std::process::exit(0);
+                }
+                if input.is_empty() {
+                    continue;
+                }
+
+                let lowercase_input = input.to_lowercase();
+
+                // Handle /cofl and /baf commands (matching TypeScript consoleHandler.ts)
+                if lowercase_input.starts_with("/cofl") || lowercase_input.starts_with("/baf") {
+                    let parts: Vec<&str> = input.split_whitespace().collect();
+                    if parts.len() > 1 {
+                        let command = parts[1];
+                        let args = parts[2..].join(" ");
+
+                        // Handle locally-processed commands (matching TypeScript consoleHandler.ts)
+                        match command.to_lowercase().as_str() {
+                            "queue" => {
+                                // Show command queue status
+                                let depth = command_queue_for_console.len();
+                                info!("━━━━━━━ Command Queue Status ━━━━━━━");
+                                info!("Queue depth: {}", depth);
+                                info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                                continue;
+                            }
+                            "clearqueue" => {
+                                // Clear command queue
+                                command_queue_for_console.clear();
+                                info!("Command queue cleared");
+                                continue;
+                            }
+                            // TODO: Add other local commands like forceClaim, connect, sellbz when implemented
+                            _ => {
+                                // Fall through to send to websocket
+                            }
+                        }
+
+                        // Send to websocket with command as type
+                        // Match TypeScript: data field must be JSON-stringified (double-encoded)
+                        let data_json = match serde_json::to_string(&args) {
+                            Ok(json) => json,
+                            Err(e) => {
+                                error!("Failed to serialize command args: {}", e);
+                                "\"\"".to_string()
+                            }
+                        };
+                        let message = serde_json::json!({
+                            "type": command,
+                            "data": data_json  // JSON-stringified to match TypeScript JSON.stringify()
+                        })
+                        .to_string();
+
+                        if let Err(e) = ws_client_for_console.send_message(&message).await {
+                            error!("Failed to send command to websocket: {}", e);
+                        } else {
+                            info!("Sent command to COFL: {} {}", command, args);
+                        }
+                    } else {
+                        // Bare /cofl or /baf command - send as chat type with empty data
+                        let data_json = serde_json::to_string("").unwrap();
+                        let message = serde_json::json!({
+                            "type": "chat",
+                            "data": data_json
+                        })
+                        .to_string();
+
+                        if let Err(e) = ws_client_for_console.send_message(&message).await {
+                            error!("Failed to send bare /cofl command to websocket: {}", e);
+                        }
                     }
                 }
-            }
-        });
-
-        while let Some(line) = line_rx.recv().await {
-            let input = line.trim();
-            if input == "__SHUTDOWN__" {
-                info!("Received Ctrl+C — shutting down BAF...");
-                std::process::exit(0);
-            }
-            if input.is_empty() {
-                continue;
-            }
-
-            let lowercase_input = input.to_lowercase();
-
-            // Handle /cofl and /baf commands (matching TypeScript consoleHandler.ts)
-            if lowercase_input.starts_with("/cofl") || lowercase_input.starts_with("/baf") {
-                let parts: Vec<&str> = input.split_whitespace().collect();
-                if parts.len() > 1 {
-                    let command = parts[1];
-                    let args = parts[2..].join(" ");
-
-                    // Handle locally-processed commands (matching TypeScript consoleHandler.ts)
-                    match command.to_lowercase().as_str() {
-                        "queue" => {
-                            // Show command queue status
-                            let depth = command_queue_for_console.len();
-                            info!("━━━━━━━ Command Queue Status ━━━━━━━");
-                            info!("Queue depth: {}", depth);
-                            info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                            continue;
-                        }
-                        "clearqueue" => {
-                            // Clear command queue
-                            command_queue_for_console.clear();
-                            info!("Command queue cleared");
-                            continue;
-                        }
-                        // TODO: Add other local commands like forceClaim, connect, sellbz when implemented
-                        _ => {
-                            // Fall through to send to websocket
-                        }
-                    }
-
-                    // Send to websocket with command as type
-                    // Match TypeScript: data field must be JSON-stringified (double-encoded)
-                    let data_json = match serde_json::to_string(&args) {
+                // Handle other slash commands - send to Minecraft
+                else if input.starts_with('/') {
+                    command_queue_for_console.enqueue(
+                        purse_pilot::types::CommandType::SendChat {
+                            message: input.to_string(),
+                        },
+                        purse_pilot::types::CommandPriority::High,
+                        false,
+                    );
+                    info!("Queued Minecraft command: {}", input);
+                }
+                // Non-slash messages go to websocket as chat (matching TypeScript)
+                else {
+                    // Match TypeScript: data field must be JSON-stringified
+                    let data_json = match serde_json::to_string(&input) {
                         Ok(json) => json,
                         Err(e) => {
-                            error!("Failed to serialize command args: {}", e);
+                            error!("Failed to serialize chat message: {}", e);
                             "\"\"".to_string()
                         }
                     };
                     let message = serde_json::json!({
-                        "type": command,
+                        "type": "chat",
                         "data": data_json  // JSON-stringified to match TypeScript JSON.stringify()
                     })
                     .to_string();
 
                     if let Err(e) = ws_client_for_console.send_message(&message).await {
-                        error!("Failed to send command to websocket: {}", e);
+                        error!("Failed to send chat to websocket: {}", e);
                     } else {
-                        info!("Sent command to COFL: {} {}", command, args);
-                    }
-                } else {
-                    // Bare /cofl or /baf command - send as chat type with empty data
-                    let data_json = serde_json::to_string("").unwrap();
-                    let message = serde_json::json!({
-                        "type": "chat",
-                        "data": data_json
-                    })
-                    .to_string();
-
-                    if let Err(e) = ws_client_for_console.send_message(&message).await {
-                        error!("Failed to send bare /cofl command to websocket: {}", e);
+                        debug!("Sent chat to COFL: {}", input);
                     }
                 }
             }
-            // Handle other slash commands - send to Minecraft
-            else if input.starts_with('/') {
-                command_queue_for_console.enqueue(
-                    purse_pilot::types::CommandType::SendChat {
-                        message: input.to_string(),
-                    },
-                    purse_pilot::types::CommandPriority::High,
-                    false,
-                );
-                info!("Queued Minecraft command: {}", input);
-            }
-            // Non-slash messages go to websocket as chat (matching TypeScript)
-            else {
-                // Match TypeScript: data field must be JSON-stringified
-                let data_json = match serde_json::to_string(&input) {
-                    Ok(json) => json,
-                    Err(e) => {
-                        error!("Failed to serialize chat message: {}", e);
-                        "\"\"".to_string()
-                    }
-                };
-                let message = serde_json::json!({
-                    "type": "chat",
-                    "data": data_json  // JSON-stringified to match TypeScript JSON.stringify()
-                })
-                .to_string();
-
-                if let Err(e) = ws_client_for_console.send_message(&message).await {
-                    error!("Failed to send chat to websocket: {}", e);
-                } else {
-                    debug!("Sent chat to COFL: {}", input);
-                }
-            }
-        }
-    });
+        });
+    } else {
+        info!("Console interface disabled — stdin is not an interactive terminal or enable_console_input=false");
+    }
 
     // COFL now automatically sends bazaar flip recommendations — no periodic
     // request needed (previously sent getbazaarflips every 5 minutes).
@@ -3727,6 +4153,12 @@ async fn main() -> Result<()> {
         let bazaar_tracker_orders = bazaar_tracker.clone();
         let order_interval = config.bazaar_order_check_interval_seconds;
         let cancel_minutes_per_million = config.bazaar_order_cancel_minutes_per_million;
+        let periodic_stale_buy_max_age_seconds =
+            config.local_bazaar_stale_buy_max_age_seconds.max(60);
+        let periodic_stale_sell_max_age_seconds = config
+            .local_bazaar_stale_sell_max_age_seconds
+            .max(periodic_stale_buy_max_age_seconds);
+        let periodic_max_stale_buy_orders = config.local_bazaar_max_stale_buy_orders;
         tokio::spawn(async move {
             use purse_pilot::types::{CommandPriority, CommandType};
             // Give startup workflow time to complete before starting periodic checks
@@ -3745,7 +4177,21 @@ async fn main() -> Result<()> {
                 // unfilled orders, so we must not skip it even when nothing
                 // appears filled — the ManageOrders handler will close
                 // immediately if it finds nothing actionable.
-                if !bazaar_tracker_orders.has_filled_orders() && cancel_minutes_per_million == 0 {
+                let order_snapshot = bazaar_tracker_orders.profit_audit_snapshot();
+                let has_sell_backlog = !order_snapshot.items_waiting_for_sell.is_empty()
+                    || (order_snapshot.actionable_cost_lot_value > 0.0
+                        && order_snapshot.active_sell_orders == 0);
+                let stale_buy_pressure = bazaar_tracker_orders
+                    .stale_order_count(true, periodic_stale_buy_max_age_seconds)
+                    > periodic_max_stale_buy_orders;
+                let stale_sell_pressure = bazaar_tracker_orders
+                    .stale_order_count(false, periodic_stale_sell_max_age_seconds)
+                    > 0;
+                let has_lifecycle_work = bazaar_tracker_orders.has_filled_orders()
+                    || has_sell_backlog
+                    || stale_buy_pressure
+                    || stale_sell_pressure;
+                if !has_lifecycle_work && cancel_minutes_per_million == 0 {
                     debug!("[BazaarOrders] No filled orders in tracker — skipping periodic ManageOrders");
                     continue;
                 }
@@ -3802,6 +4248,21 @@ async fn main() -> Result<()> {
         let local_scan_interval = config.local_bazaar_scan_interval_seconds.max(30);
         let local_max_concurrent = config.local_bazaar_max_concurrent_orders.max(1);
         let local_purse_reserve_percent = config.purse_reserve_percent.clamp(0.0, 95.0);
+        let configured_total_capital = config.local_bazaar_total_capital;
+        let stale_buy_max_age_seconds = config.local_bazaar_stale_buy_max_age_seconds.max(60);
+        let stale_sell_max_age_seconds = config
+            .local_bazaar_stale_sell_max_age_seconds
+            .max(stale_buy_max_age_seconds);
+        let lifecycle_config = purse_pilot::bazaar_lifecycle::BazaarLifecycleConfig {
+            max_stale_buy_orders: config.local_bazaar_max_stale_buy_orders,
+            pause_new_buys_when_stale_buy_pressure: config
+                .local_bazaar_pause_new_buys_when_stale_buy_pressure,
+            cancel_stale_buys_when_sell_queue_pending: config
+                .local_bazaar_cancel_stale_buys_when_sell_queue_pending,
+        };
+        let lifecycle_config_reprice = lifecycle_config.clone();
+        let stale_buy_max_age_seconds_reprice = stale_buy_max_age_seconds;
+        let stale_sell_max_age_seconds_reprice = stale_sell_max_age_seconds;
         let local_scan_config = purse_pilot::bazaar_scanner::LocalBazaarScanConfig {
             min_profit_per_unit: config.local_bazaar_min_profit_per_unit,
             min_total_profit: config
@@ -3854,6 +4315,8 @@ async fn main() -> Result<()> {
         let local_reprice_config = local_scan_config.clone();
         tokio::spawn(async move {
             use purse_pilot::types::{CommandPriority, CommandType};
+            let mut sell_backlog_since: Option<Instant> = None;
+            let mut last_skyblock_recovery_at: Option<Instant> = None;
             sleep(Duration::from_secs(10)).await;
             loop {
                 if !enable_bazaar_flips_local_bz.load(Ordering::Relaxed)
@@ -3864,6 +4327,35 @@ async fn main() -> Result<()> {
                 {
                     debug!("[LocalBazaar] Skipping scan — bot not ready for Bazaar orders");
                     sleep(Duration::from_secs(10)).await;
+                    continue;
+                }
+
+                if !bot_client_local_bz.has_skyblock_context() {
+                    warn!(
+                        "[BAF][RECOVERY] Holding Local Bazaar scan — SkyBlock scoreboard context is not ready"
+                    );
+                    let should_recover = last_skyblock_recovery_at
+                        .map(|last| last.elapsed() >= Duration::from_secs(60))
+                        .unwrap_or(true);
+                    if should_recover && command_queue_local_bz.is_empty() {
+                        last_skyblock_recovery_at = Some(Instant::now());
+                        command_queue_local_bz.enqueue(
+                            CommandType::SendChat {
+                                message: "/play sb".to_string(),
+                            },
+                            CommandPriority::Critical,
+                            false,
+                        );
+                        sleep(Duration::from_secs(12)).await;
+                        command_queue_local_bz.enqueue(
+                            CommandType::SendChat {
+                                message: "/is".to_string(),
+                            },
+                            CommandPriority::Critical,
+                            false,
+                        );
+                    }
+                    sleep(Duration::from_secs(20)).await;
                     continue;
                 }
 
@@ -3891,6 +4383,10 @@ async fn main() -> Result<()> {
                             && (o.status == "open" || o.status == "filled")
                     })
                     .count();
+                let active_buy_count = active_orders
+                    .iter()
+                    .filter(|o| o.is_buy_order && (o.status == "open" || o.status == "filled"))
+                    .count();
                 let capital_in_buy_orders: f64 = active_orders
                     .iter()
                     .filter(|o| o.is_buy_order && (o.status == "open" || o.status == "filled"))
@@ -3910,6 +4406,251 @@ async fn main() -> Result<()> {
                     .filter(|o| o.status == "open" || o.status == "filled")
                     .map(|o| purse_pilot::bazaar_tracker::normalize_for_match_pub(&o.item_name))
                     .collect();
+                let audit_snapshot = bazaar_tracker_local_bz.profit_audit_snapshot();
+                let capital_blocker_cooldowns = apply_live_capital_blocker_cooldowns(
+                    &audit_snapshot,
+                    &bazaar_tracker_local_bz,
+                    local_scan_config.per_item_exposure_cap,
+                );
+                if capital_blocker_cooldowns > 0 {
+                    info!(
+                        "[BAF][ITEM_COOLDOWN] applied_live_capital_blocker_cooldowns={}",
+                        capital_blocker_cooldowns
+                    );
+                }
+                let duplicate_active_sell_target =
+                    bazaar_tracker_local_bz.duplicate_active_sell_order_target();
+                let duplicate_active_sell_items =
+                    usize::from(duplicate_active_sell_target.is_some());
+                let sell_backlog_active = !audit_snapshot.items_waiting_for_sell.is_empty()
+                    || (audit_snapshot.actionable_cost_lot_value > 0.0
+                        && audit_snapshot.active_sell_orders == 0);
+                if sell_backlog_active {
+                    sell_backlog_since.get_or_insert_with(Instant::now);
+                } else {
+                    sell_backlog_since = None;
+                }
+                let sell_backlog_age_seconds = sell_backlog_since
+                    .map(|started| started.elapsed().as_secs())
+                    .unwrap_or(0);
+                let configured_stale_buy_orders =
+                    bazaar_tracker_local_bz.stale_order_count(true, stale_buy_max_age_seconds);
+                let configured_stale_sell_orders =
+                    bazaar_tracker_local_bz.stale_order_count(false, stale_sell_max_age_seconds);
+                let lifecycle_state = purse_pilot::bazaar_lifecycle::BazaarLifecycleState {
+                    bot_can_accept_commands: bot_client_local_bz.state().allows_commands(),
+                    command_queue_busy: !command_queue_local_bz.is_empty(),
+                    startup_in_progress: bot_client_local_bz.is_startup_in_progress(),
+                    daily_sell_limit: bot_client_local_bz.is_bazaar_daily_limit(),
+                    filled_sell_orders: bazaar_tracker_local_bz.filled_order_count(false),
+                    filled_buy_orders: bazaar_tracker_local_bz.filled_order_count(true),
+                    items_waiting_for_sell: audit_snapshot.items_waiting_for_sell.len(),
+                    remaining_cost_lot_value: audit_snapshot.actionable_cost_lot_value,
+                    active_sell_orders: audit_snapshot.active_sell_orders,
+                    duplicate_active_sell_items,
+                    stale_sell_orders: configured_stale_sell_orders,
+                    stale_buy_orders: configured_stale_buy_orders,
+                    useful_reprice_available: false,
+                    sell_backlog_age_seconds,
+                };
+                let lifecycle_decision =
+                    purse_pilot::bazaar_lifecycle::determine_next_bazaar_action(
+                        &lifecycle_state,
+                        &lifecycle_config,
+                    );
+                info!(
+                    "[BAF][LIFECYCLE] next_action={} reason={} block_new_buys={} waiting_for_sell={} active_sell_orders={} duplicate_sell_items={} stale_buys={} stale_sells={} cost_lot_value={:.0} open_buy_capital={:.0}",
+                    lifecycle_decision.action.as_str(),
+                    lifecycle_decision.reason,
+                    lifecycle_decision.block_new_buys,
+                    audit_snapshot.items_waiting_for_sell.len(),
+                    audit_snapshot.active_sell_orders,
+                    duplicate_active_sell_items,
+                    configured_stale_buy_orders,
+                    configured_stale_sell_orders,
+                    audit_snapshot.remaining_cost_lot_value,
+                    audit_snapshot.open_buy_capital
+                );
+                if lifecycle_decision.flow_stall {
+                    warn!(
+                        "[BAF][FLOW_STALL] action={} reason={} age={}s waiting_for_sell={:?} active_sell_orders={} stale_buys={} open_buy_capital={:.0} cost_lot_value={:.0}",
+                        lifecycle_decision.action.as_str(),
+                        lifecycle_decision.reason,
+                        sell_backlog_age_seconds,
+                        audit_snapshot.items_waiting_for_sell,
+                        audit_snapshot.active_sell_orders,
+                        configured_stale_buy_orders,
+                        audit_snapshot.open_buy_capital,
+                        audit_snapshot.remaining_cost_lot_value
+                    );
+                }
+
+                match lifecycle_decision.action {
+                    purse_pilot::bazaar_lifecycle::BazaarNextAction::RecoverGui => {
+                        warn!(
+                            "[BAF][LIFECYCLE] RecoverGui requested; state={:?}, queue_depth={}",
+                            bot_client_local_bz.state(),
+                            command_queue_local_bz.len()
+                        );
+                        sleep(Duration::from_secs(10)).await;
+                        continue;
+                    }
+                    purse_pilot::bazaar_lifecycle::BazaarNextAction::ClaimFilledSells
+                    | purse_pilot::bazaar_lifecycle::BazaarNextAction::ClaimFilledBuys => {
+                        if !command_queue_local_bz.has_manage_orders() {
+                            command_queue_local_bz.enqueue(
+                                CommandType::ManageOrders {
+                                    cancel_open: false,
+                                    target_item: None,
+                                },
+                                CommandPriority::Critical,
+                                false,
+                            );
+                        }
+                        sleep(Duration::from_secs(10)).await;
+                        continue;
+                    }
+                    purse_pilot::bazaar_lifecycle::BazaarNextAction::HandleStaleSells => {
+                        let target = if let Some((item_name, count, amount)) =
+                            duplicate_active_sell_target.clone()
+                        {
+                            warn!(
+                                "[BAF][SELL_CONSOLIDATE] item={} active_sell_orders={} active_sell_amount={} action=cancel_duplicate_sell_before_new_buy",
+                                item_name, count, amount
+                            );
+                            Some((item_name, false))
+                        } else {
+                            bazaar_tracker_local_bz
+                                .oldest_stale_order(false, stale_sell_max_age_seconds)
+                                .map(|o| (o.item_name, false))
+                        };
+                        if !command_queue_local_bz.has_manage_orders() {
+                            command_queue_local_bz.enqueue(
+                                CommandType::ManageOrders {
+                                    cancel_open: false,
+                                    target_item: target,
+                                },
+                                CommandPriority::Critical,
+                                false,
+                            );
+                        }
+                        sleep(Duration::from_secs(12)).await;
+                        continue;
+                    }
+                    purse_pilot::bazaar_lifecycle::BazaarNextAction::HandleStaleBuys => {
+                        let target = bazaar_tracker_local_bz
+                            .oldest_stale_order(true, stale_buy_max_age_seconds)
+                            .map(|o| (o.item_name, true));
+                        if !command_queue_local_bz.has_manage_orders() {
+                            command_queue_local_bz.enqueue(
+                                CommandType::ManageOrders {
+                                    cancel_open: false,
+                                    target_item: target,
+                                },
+                                CommandPriority::Critical,
+                                false,
+                            );
+                        }
+                        sleep(Duration::from_secs(12)).await;
+                        continue;
+                    }
+                    purse_pilot::bazaar_lifecycle::BazaarNextAction::Idle => {
+                        sleep(Duration::from_secs(10)).await;
+                        continue;
+                    }
+                    purse_pilot::bazaar_lifecycle::BazaarNextAction::PlaceMissingSellOrders
+                    | purse_pilot::bazaar_lifecycle::BazaarNextAction::PlaceNewBuy
+                    | purse_pilot::bazaar_lifecycle::BazaarNextAction::RepriceUsefulOrder => {}
+                }
+
+                let max_live_open_buy_capital = configured_total_capital as f64
+                    * local_scan_config
+                        .max_open_buy_capital_ratio
+                        .clamp(0.05, 1.0);
+                if audit_snapshot.open_buy_capital > max_live_open_buy_capital
+                    || active_buy_count > local_max_concurrent
+                {
+                    let target = bazaar_tracker_local_bz
+                        .oldest_stale_order(true, 0)
+                        .map(|o| (o.item_name, true));
+                    warn!(
+                        "[BAF][POSITION_LIMIT] Open BUY pressure exceeds live guard — active_BUYs={} max={} open_buy_capital={:.0} cap={:.0}; action=cancel_oldest_buy target={:?}",
+                        active_buy_count,
+                        local_max_concurrent,
+                        audit_snapshot.open_buy_capital,
+                        max_live_open_buy_capital,
+                        target
+                    );
+                    if !command_queue_local_bz.has_manage_orders() {
+                        command_queue_local_bz.enqueue(
+                            CommandType::ManageOrders {
+                                cancel_open: false,
+                                target_item: target,
+                            },
+                            CommandPriority::Critical,
+                            false,
+                        );
+                    }
+                    sleep(Duration::from_secs(12)).await;
+                    continue;
+                }
+                let per_item_live_cap = local_scan_config.per_item_exposure_cap as f64;
+                if per_item_live_cap > 0.0 {
+                    let mut grouped_open_buy: HashMap<String, (f64, usize, u64, String)> =
+                        HashMap::new();
+                    for order in bazaar_tracker_local_bz
+                        .get_orders()
+                        .into_iter()
+                        .filter(|order| {
+                            order.is_buy_order
+                                && (order.status == "open" || order.status == "filled")
+                        })
+                    {
+                        let normalized =
+                            purse_pilot::bazaar_tracker::normalize_for_match_pub(&order.item_name);
+                        let entry = grouped_open_buy.entry(normalized).or_insert((
+                            0.0,
+                            0,
+                            order.placed_at,
+                            order.item_name.clone(),
+                        ));
+                        entry.0 += order.price_per_unit * order.amount as f64;
+                        entry.1 += 1;
+                        if order.placed_at <= entry.2 {
+                            entry.2 = order.placed_at;
+                            entry.3 = order.item_name.clone();
+                        }
+                    }
+                    if let Some((_, (value, count, _, item_name))) = grouped_open_buy
+                        .into_iter()
+                        .filter(|(_, (value, count, _, _))| {
+                            *count > 1 && *value > per_item_live_cap
+                        })
+                        .max_by(|a, b| {
+                            a.1 .0
+                                .partial_cmp(&b.1 .0)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                    {
+                        let target = Some((item_name, true));
+                        warn!(
+                            "[BAF][POSITION_LIMIT] Per-item BUY exposure exceeds live guard — open_buy_value={:.0} count={} cap={:.0}; action=cancel_oldest_item_buy target={:?}",
+                            value, count, per_item_live_cap, target
+                        );
+                        if !command_queue_local_bz.has_manage_orders() {
+                            command_queue_local_bz.enqueue(
+                                CommandType::ManageOrders {
+                                    cancel_open: false,
+                                    target_item: target,
+                                },
+                                CommandPriority::Critical,
+                                false,
+                            );
+                        }
+                        sleep(Duration::from_secs(12)).await;
+                        continue;
+                    }
+                }
 
                 let bazaar_quotes = match purse_pilot::bazaar_scanner::fetch_product_quotes().await
                 {
@@ -3923,8 +4664,11 @@ async fn main() -> Result<()> {
 
                 let mut inventory_sells_queued = 0usize;
                 let mut inventory_sellable_stacks = 0usize;
+                let mut cached_inventory_counts: Option<HashMap<String, u64>> = None;
                 let free_inventory_slots = bot_client_local_bz.empty_slot_count() as u64;
                 if let Some(inv_json) = bot_client_local_bz.get_cached_inventory_json() {
+                    cached_inventory_counts =
+                        Some(cached_inventory_bazaar_count_map(&inv_json, &bazaar_quotes));
                     let sellable_inventory =
                         count_cached_inventory_bazaar_items(&inv_json, &bazaar_quotes);
                     inventory_sellable_stacks = sellable_inventory.len();
@@ -3985,7 +4729,7 @@ async fn main() -> Result<()> {
                         command_queue_local_bz.enqueue(
                             CommandType::BazaarSellOrder {
                                 item_name,
-                                item_tag: None,
+                                item_tag: Some(item_tag.clone()),
                                 amount,
                                 price_per_unit: sell_price,
                             },
@@ -3993,7 +4737,7 @@ async fn main() -> Result<()> {
                             true,
                         );
                         inventory_sells_queued += 1;
-                        sleep(Duration::from_millis(600 + (rand::random::<u64>() % 800))).await;
+                        sleep(Duration::from_millis(250)).await;
                     }
                 } else {
                     debug!("[LocalBazaar] No cached inventory yet for inventory sell scan");
@@ -4004,10 +4748,59 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                let active_buy_count = active_orders
-                    .iter()
-                    .filter(|o| o.is_buy_order && (o.status == "open" || o.status == "filled"))
-                    .count();
+                if lifecycle_decision.action
+                    == purse_pilot::bazaar_lifecycle::BazaarNextAction::PlaceMissingSellOrders
+                {
+                    let queued_missing_sells = queue_missing_sell_orders_for_cost_lots(
+                        &audit_snapshot,
+                        &bazaar_quotes,
+                        cached_inventory_counts.as_ref(),
+                        &bazaar_tracker_local_bz,
+                        &command_queue_local_bz,
+                        &chat_tx_local_bz,
+                        local_scan_config.bazaar_tax_rate,
+                        local_scan_config.price_undercut,
+                    );
+                    if queued_missing_sells == 0 {
+                        warn!(
+                            "[BAF][LIFECYCLE] Missing SELL backlog could not be queued directly; forcing ManageOrders refresh before any BUY"
+                        );
+                        if !command_queue_local_bz.has_manage_orders() {
+                            command_queue_local_bz.enqueue(
+                                CommandType::ManageOrders {
+                                    cancel_open: false,
+                                    target_item: None,
+                                },
+                                CommandPriority::Critical,
+                                false,
+                            );
+                        }
+                    }
+                    sleep(Duration::from_secs(12)).await;
+                    continue;
+                }
+
+                if let Some((item_name, reason, cooldown_until)) =
+                    bazaar_tracker_local_bz.active_buy_order_on_cooldown()
+                {
+                    warn!(
+                        "[BAF][ITEM_COOLDOWN] Active BUY for cooldowned item {} — reason={} cooldown_until={} action=target_cancel",
+                        item_name, reason, cooldown_until
+                    );
+                    if !command_queue_local_bz.has_manage_orders() {
+                        command_queue_local_bz.enqueue(
+                            CommandType::ManageOrders {
+                                cancel_open: false,
+                                target_item: Some((item_name, true)),
+                            },
+                            CommandPriority::Critical,
+                            false,
+                        );
+                    }
+                    sleep(Duration::from_secs(12)).await;
+                    continue;
+                }
+
                 if bot_client_local_bz.has_stashed_items() {
                     let pickup_threshold =
                         local_scan_config.min_free_inventory_slots.saturating_add(6);
@@ -4082,13 +4875,21 @@ async fn main() -> Result<()> {
                     sleep(Duration::from_secs(20)).await;
                     continue;
                 }
-                let sell_backlog_limit = (local_max_concurrent / 2).max(2);
-                if active_sell_count >= sell_backlog_limit
-                    && active_buy_count <= active_sell_count.saturating_sub(2)
-                {
+                if should_hold_buy_scan_for_sell_rotation(
+                    active_sell_count,
+                    audit_snapshot.remaining_cost_lot_value,
+                    audit_snapshot.open_sell_value,
+                    configured_total_capital,
+                    local_scan_config.max_cost_lot_capital_ratio,
+                    local_max_concurrent,
+                    local_scan_config.max_pending_buy_stacks,
+                ) {
                     info!(
-                        "[LocalBazaar] Holding BUY scan — SELL backlog active SELLs {} >= {}, active BUYs {}; waiting for sell rotation",
-                        active_sell_count, sell_backlog_limit, active_buy_count
+                        "[LocalBazaar] Holding BUY scan — SELL rotation pressure active SELLs {}, cost_lot_value {:.0}, open_sell_value {:.0}, active BUYs {}; waiting for sell rotation",
+                        active_sell_count,
+                        audit_snapshot.remaining_cost_lot_value,
+                        audit_snapshot.open_sell_value,
+                        active_buy_count
                     );
                     sleep(Duration::from_secs(20)).await;
                     continue;
@@ -4125,7 +4926,7 @@ async fn main() -> Result<()> {
                     profit_per_hour_from_points(&profit_tracker_local_bz.bz_points());
                 info!(
                     "[LocalBazaar] live metrics active_capital_model {}, reserved_purse {}, capital_in_buy_orders {:.0}, capital_in_sell_orders {:.0}, free_buy_budget {}, free_inventory_slots {}, actual_bz_profit/h {}, active_BUYs {}, active_SELLs {}",
-                    format_coins(config.local_bazaar_total_capital as i64),
+                    format_coins(configured_total_capital as i64),
                     reserved_purse,
                     capital_in_buy_orders,
                     capital_in_sell_orders,
@@ -4156,7 +4957,6 @@ async fn main() -> Result<()> {
                 scan_config_for_budget.active_buy_order_count = active_buy_count as u64;
                 scan_config_for_budget.active_sell_order_count = active_sell_count as u64;
                 scan_config_for_budget.inventory_sellable_stacks = inventory_sellable_stacks as u64;
-                let audit_snapshot = bazaar_tracker_local_bz.profit_audit_snapshot();
                 scan_config_for_budget.total_cost_lot_value =
                     audit_snapshot.remaining_cost_lot_value;
                 scan_config_for_budget.open_buy_capital = audit_snapshot.open_buy_capital;
@@ -4177,11 +4977,25 @@ async fn main() -> Result<()> {
                     }
                 };
 
+                let max_projected_open_buy_capital = configured_total_capital as f64
+                    * scan_config_for_budget
+                        .max_open_buy_capital_ratio
+                        .clamp(0.05, 1.0);
+                let mut projected_open_buy_capital = audit_snapshot.open_buy_capital.max(0.0);
+                let mut projected_active_buy_count = active_buy_count;
+                let mut projected_active_items = active_items.clone();
                 let mut queued = 0usize;
                 let mut remaining_buy_budget = purse_budget.unwrap_or(u64::MAX);
                 for flip in flips {
                     if queued >= slots_to_fill {
                         break;
+                    }
+                    if projected_active_buy_count >= local_max_concurrent {
+                        info!(
+                            "[BAF][POSITION_LIMIT] Rejecting {} — projected_active_buy_orders {} >= max {}",
+                            flip.item_name, projected_active_buy_count, local_max_concurrent
+                        );
+                        continue;
                     }
                     let order_cost = (flip.buy_price_per_unit * flip.amount as f64)
                         .ceil()
@@ -4189,8 +5003,29 @@ async fn main() -> Result<()> {
                     if order_cost == 0 || order_cost > remaining_buy_budget {
                         continue;
                     }
+                    if projected_open_buy_capital + order_cost as f64
+                        > max_projected_open_buy_capital
+                    {
+                        info!(
+                            "[BAF][POSITION_LIMIT] Rejecting {} — projected_open_buy_capital {:.0} + order_cost {} would exceed cap {:.0}",
+                            flip.item_name,
+                            projected_open_buy_capital,
+                            order_cost,
+                            max_projected_open_buy_capital
+                        );
+                        continue;
+                    }
                     let normalized =
                         purse_pilot::bazaar_tracker::normalize_for_match_pub(&flip.item_name);
+                    if let Some((cooldown_until, reason)) =
+                        bazaar_tracker_local_bz.item_cooldown_reason(&flip.item_name)
+                    {
+                        warn!(
+                            "[BAF][ITEM_COOLDOWN] Rejecting {} — reason={} cooldown_until={}",
+                            flip.item_name, reason, cooldown_until
+                        );
+                        continue;
+                    }
                     let item_open_buy_capital =
                         bazaar_tracker_local_bz.open_order_value_for(&flip.item_name, true);
                     let item_open_sell_value =
@@ -4201,7 +5036,7 @@ async fn main() -> Result<()> {
                         item_open_buy_capital,
                         item_cost_lot_value,
                         item_open_sell_value,
-                        audit_snapshot.open_buy_capital,
+                        projected_open_buy_capital,
                         audit_snapshot.remaining_cost_lot_value,
                         audit_snapshot.open_sell_value,
                         &scan_config_for_budget,
@@ -4215,9 +5050,16 @@ async fn main() -> Result<()> {
                             continue;
                         }
                     }
-                    if active_items.contains(&normalized) {
+                    if projected_active_items.contains(&normalized) {
                         info!(
                             "[BAF][POSITION_LIMIT] Rejecting {} — COST_LOTS_ALREADY_OPEN/active order",
+                            flip.item_name
+                        );
+                        continue;
+                    }
+                    if command_queue_local_bz.has_bazaar_buy_order_for(&flip.item_name) {
+                        info!(
+                            "[BAF][POSITION_LIMIT] Rejecting {} — BUY_ALREADY_QUEUED_OR_RUNNING",
                             flip.item_name
                         );
                         continue;
@@ -4267,7 +5109,7 @@ async fn main() -> Result<()> {
                     command_queue_local_bz.enqueue(
                         CommandType::BazaarBuyOrder {
                             item_name: flip.item_name,
-                            item_tag: None,
+                            item_tag: Some(flip.item_tag.clone()),
                             amount: flip.amount,
                             price_per_unit: flip.buy_price_per_unit,
                         },
@@ -4275,17 +5117,19 @@ async fn main() -> Result<()> {
                         true,
                     );
                     queued += 1;
+                    projected_open_buy_capital += order_cost as f64;
+                    projected_active_buy_count += 1;
+                    projected_active_items.insert(normalized);
                     remaining_buy_budget = remaining_buy_budget.saturating_sub(order_cost);
 
-                    sleep(Duration::from_millis(700 + (rand::random::<u64>() % 900))).await;
+                    sleep(Duration::from_millis(250)).await;
                 }
 
                 if queued == 0 {
                     debug!("[LocalBazaar] No qualifying flips found for current filters");
                 }
 
-                let jitter = rand::random::<u64>() % 21;
-                sleep(Duration::from_secs(local_scan_interval + jitter)).await;
+                sleep(Duration::from_secs(local_scan_interval)).await;
             }
         });
 
@@ -4313,6 +5157,49 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
+                let reprice_snapshot = bazaar_tracker_reprice_bz.profit_audit_snapshot();
+                let reprice_lifecycle_state = purse_pilot::bazaar_lifecycle::BazaarLifecycleState {
+                    bot_can_accept_commands: bot_client_reprice_bz.state().allows_commands(),
+                    command_queue_busy: !command_queue_reprice_bz.is_empty(),
+                    startup_in_progress: bot_client_reprice_bz.is_startup_in_progress(),
+                    daily_sell_limit: bot_client_reprice_bz.is_bazaar_daily_limit(),
+                    filled_sell_orders: bazaar_tracker_reprice_bz.filled_order_count(false),
+                    filled_buy_orders: bazaar_tracker_reprice_bz.filled_order_count(true),
+                    items_waiting_for_sell: reprice_snapshot.items_waiting_for_sell.len(),
+                    remaining_cost_lot_value: reprice_snapshot.actionable_cost_lot_value,
+                    active_sell_orders: reprice_snapshot.active_sell_orders,
+                    duplicate_active_sell_items: usize::from(
+                        bazaar_tracker_reprice_bz
+                            .duplicate_active_sell_order_target()
+                            .is_some(),
+                    ),
+                    stale_sell_orders: bazaar_tracker_reprice_bz
+                        .stale_order_count(false, stale_sell_max_age_seconds_reprice),
+                    stale_buy_orders: bazaar_tracker_reprice_bz
+                        .stale_order_count(true, stale_buy_max_age_seconds_reprice),
+                    useful_reprice_available: true,
+                    sell_backlog_age_seconds: 0,
+                };
+                let reprice_decision = purse_pilot::bazaar_lifecycle::determine_next_bazaar_action(
+                    &reprice_lifecycle_state,
+                    &lifecycle_config_reprice,
+                );
+                if !matches!(
+                    reprice_decision.action,
+                    purse_pilot::bazaar_lifecycle::BazaarNextAction::RepriceUsefulOrder
+                        | purse_pilot::bazaar_lifecycle::BazaarNextAction::PlaceNewBuy
+                ) {
+                    debug!(
+                        "[BAF][LIFECYCLE] Reprice paused next_action={} reason={} waiting_for_sell={} stale_buys={} cost_lot_value={:.0}",
+                        reprice_decision.action.as_str(),
+                        reprice_decision.reason,
+                        reprice_snapshot.items_waiting_for_sell.len(),
+                        reprice_lifecycle_state.stale_buy_orders,
+                        reprice_snapshot.remaining_cost_lot_value
+                    );
+                    continue;
+                }
+
                 let quotes = match purse_pilot::bazaar_scanner::fetch_product_quotes().await {
                     Ok(quotes) => quotes,
                     Err(e) => {
@@ -4331,7 +5218,188 @@ async fn main() -> Result<()> {
                 let tax_multiplier = 1.0 - (local_reprice_config.bazaar_tax_rate.max(0.0) / 100.0);
                 let price_step = local_reprice_config.price_undercut.max(0.0);
 
-                for order in bazaar_tracker_reprice_bz.get_orders() {
+                let tracked_orders = bazaar_tracker_reprice_bz.get_orders();
+
+                for order in tracked_orders.iter() {
+                    if order.is_buy_order || order.status != "open" {
+                        continue;
+                    }
+                    let order_age = now_secs.saturating_sub(order.placed_at);
+                    let order_norm =
+                        purse_pilot::bazaar_tracker::normalize_for_match_pub(&order.item_name);
+                    let Some(quote) = quotes.values().find(|q| {
+                        purse_pilot::bazaar_tracker::normalize_for_match_pub(&q.item_name)
+                            == order_norm
+                    }) else {
+                        continue;
+                    };
+
+                    let fresh_sell_price =
+                        (quote.buy_price - price_step.max(quote.buy_price * 0.002)).max(0.0);
+                    let key = format!("sell:{}", order_norm);
+                    let seconds_since_last = reprice_cooldowns
+                        .get(&key)
+                        .map(|last| last.elapsed().as_secs());
+                    let Some(fifo_cost_basis_total) = bazaar_tracker_reprice_bz
+                        .peek_fifo_cost_basis(&order.item_name, order.amount)
+                    else {
+                        info!(
+                            "[BAF][SELL_REPRICE_BLOCKED] item={} amount={} reason=UNKNOWN_COST_BASIS_OR_EXCESS_ACTIVE_SELL",
+                            order.item_name, order.amount
+                        );
+                        continue;
+                    };
+                    let decision = purse_pilot::bazaar_scanner::should_reprice_sell(
+                        order_age,
+                        seconds_since_last,
+                        0,
+                        order.price_per_unit,
+                        fresh_sell_price,
+                        fifo_cost_basis_total,
+                        order.amount,
+                        &local_reprice_config,
+                    );
+                    if !decision.allowed {
+                        debug!(
+                            "[BAF][SELL_REPRICE_BLOCKED] item={} reason={} old_price={:.1} fresh_price={:.1} fifo_cost={:.1}",
+                            order.item_name,
+                            decision.reason.unwrap_or("UNKNOWN"),
+                            order.price_per_unit,
+                            fresh_sell_price,
+                            fifo_cost_basis_total
+                        );
+                        continue;
+                    }
+
+                    let sell_check = bazaar_tracker_reprice_bz.validate_sell_before_order(
+                        &order.item_name,
+                        order.amount,
+                        fresh_sell_price,
+                        local_reprice_config.bazaar_tax_rate,
+                    );
+                    if !sell_check.allowed {
+                        warn!(
+                            "[BAF][SELL_REPRICE_BLOCKED] item={} amount={} fresh_price={:.1} expected_after_tax={:.1} fifo_cost={:.1} reason={}",
+                            order.item_name,
+                            order.amount,
+                            fresh_sell_price,
+                            sell_check.expected_sell_after_tax,
+                            sell_check.fifo_cost_basis_total,
+                            sell_check.reason.as_ref().map(|r| r.as_str()).unwrap_or("UNKNOWN")
+                        );
+                        continue;
+                    }
+                    if command_queue_reprice_bz.has_bazaar_sell_order_for(&order.item_name) {
+                        info!(
+                            "[BAF][SELL_REPRICE_BLOCKED] item={} reason=SELL_ALREADY_QUEUED",
+                            order.item_name
+                        );
+                        continue;
+                    }
+
+                    let removed_queued = command_queue_reprice_bz
+                        .remove_queued_bazaar_sell_orders_for(&order.item_name);
+                    info!(
+                        "[BAF][SELL_REPRICE] item={} amount={} old_price={:.1} fresh_price={:.1} fifo_cost={:.1} removed_queued_sells={} action=cancel_and_relist",
+                        order.item_name,
+                        order.amount,
+                        order.price_per_unit,
+                        fresh_sell_price,
+                        fifo_cost_basis_total,
+                        removed_queued
+                    );
+                    let msg = format!(
+                        "§f[§4PursePilot§f]: §6[Local BZ] REPRICE SELL §r{} §7x{} @ §6{}§7",
+                        order.item_name,
+                        order.amount,
+                        format_coins_f64(fresh_sell_price)
+                    );
+                    print_mc_chat(&msg);
+                    let _ = chat_tx_reprice_bz.send(msg);
+
+                    command_queue_reprice_bz.enqueue(
+                        CommandType::ManageOrders {
+                            cancel_open: false,
+                            target_item: Some((order.item_name.clone(), false)),
+                        },
+                        CommandPriority::Critical,
+                        false,
+                    );
+
+                    let queue_after_cancel = command_queue_reprice_bz.clone();
+                    let tracker_after_cancel = bazaar_tracker_reprice_bz.clone();
+                    let item_name = order.item_name.clone();
+                    let item_tag = Some(quote.item_tag.clone());
+                    let amount = order.amount;
+                    let bazaar_tax_rate = local_reprice_config.bazaar_tax_rate;
+                    tokio::spawn(async move {
+                        sleep(Duration::from_secs(20)).await;
+                        if tracker_after_cancel.active_sell_amount_for(&item_name) > 0 {
+                            warn!(
+                                "[BAF][SELL_REPRICE_BLOCKED] item={} reason=OLD_SELL_STILL_ACTIVE_AFTER_CANCEL",
+                                item_name
+                            );
+                            return;
+                        }
+                        if queue_after_cancel.has_bazaar_sell_order_for(&item_name) {
+                            info!(
+                                "[BAF][SELL_REPRICE_BLOCKED] item={} reason=SELL_ALREADY_QUEUED_AFTER_CANCEL",
+                                item_name
+                            );
+                            return;
+                        }
+                        let amount_to_sell = tracker_after_cancel
+                            .remaining_cost_lot_amount_for(&item_name)
+                            .min(amount);
+                        if amount_to_sell == 0 {
+                            warn!(
+                                "[BAF][SELL_REPRICE_BLOCKED] item={} reason=NO_FIFO_AMOUNT_AFTER_CANCEL",
+                                item_name
+                            );
+                            return;
+                        }
+                        let sell_check = tracker_after_cancel.validate_sell_before_order(
+                            &item_name,
+                            amount_to_sell,
+                            fresh_sell_price,
+                            bazaar_tax_rate,
+                        );
+                        if !sell_check.allowed {
+                            warn!(
+                                "[BAF][SELL_REPRICE_BLOCKED] item={} amount={} fresh_price={:.1} expected_after_tax={:.1} fifo_cost={:.1} reason={}",
+                                item_name,
+                                amount_to_sell,
+                                fresh_sell_price,
+                                sell_check.expected_sell_after_tax,
+                                sell_check.fifo_cost_basis_total,
+                                sell_check.reason.as_ref().map(|r| r.as_str()).unwrap_or("UNKNOWN")
+                            );
+                            return;
+                        }
+                        tracker_after_cancel.record_planned_local_sell_amount(
+                            &item_name,
+                            fresh_sell_price,
+                            item_tag.clone(),
+                            amount_to_sell,
+                        );
+                        queue_after_cancel.enqueue(
+                            CommandType::BazaarSellOrder {
+                                item_name,
+                                item_tag,
+                                amount: amount_to_sell,
+                                price_per_unit: fresh_sell_price,
+                            },
+                            CommandPriority::Critical,
+                            false,
+                        );
+                    });
+
+                    bazaar_tracker_reprice_bz.record_reprice(&order.item_name);
+                    reprice_cooldowns.insert(key, Instant::now());
+                    break;
+                }
+
+                for order in tracked_orders {
                     if !order.is_buy_order || order.status != "open" {
                         continue;
                     }
@@ -4452,13 +5520,14 @@ async fn main() -> Result<()> {
 
                     let queue_after_cancel = command_queue_reprice_bz.clone();
                     let item_name = order.item_name.clone();
+                    let item_tag = quote.item_tag.clone();
                     let amount = order.amount;
                     tokio::spawn(async move {
                         sleep(Duration::from_secs(18)).await;
                         queue_after_cancel.enqueue(
                             CommandType::BazaarBuyOrder {
                                 item_name,
-                                item_tag: None,
+                                item_tag: Some(item_tag),
                                 amount,
                                 price_per_unit: fresh_buy_price,
                             },
@@ -5032,8 +6101,9 @@ async fn main() -> Result<()> {
 mod tests {
     use super::{
         is_ban_disconnect, parse_bz_list_flip_detail, parse_cofl_bz_h_total_profit,
-        parse_cofl_profit_response, parse_short_number, should_drop_bazaar_command_during_ah_pause,
-        should_enqueue_periodic_auction_claim,
+        parse_cofl_profit_response, parse_short_number, should_consolidate_sell_orders,
+        should_drop_bazaar_command_during_ah_pause, should_enqueue_periodic_auction_claim,
+        should_hold_buy_scan_for_sell_rotation,
     };
     use purse_pilot::types::{BotState, CommandType};
 
@@ -5125,6 +6195,66 @@ mod tests {
             },
             paused,
         ));
+    }
+
+    #[test]
+    fn sell_rotation_does_not_freeze_60m_when_sells_are_bounded() {
+        assert!(!should_hold_buy_scan_for_sell_rotation(
+            4,
+            5_552_878.3,
+            7_000_000.0,
+            60_000_000,
+            0.35,
+            6,
+            6,
+        ));
+    }
+
+    #[test]
+    fn sell_rotation_holds_when_cost_lots_hit_cap() {
+        assert!(should_hold_buy_scan_for_sell_rotation(
+            4,
+            21_000_000.0,
+            7_000_000.0,
+            60_000_000,
+            0.35,
+            6,
+            6,
+        ));
+    }
+
+    #[test]
+    fn sell_rotation_holds_when_too_many_sell_orders_accumulate() {
+        assert!(should_hold_buy_scan_for_sell_rotation(
+            12,
+            5_000_000.0,
+            7_000_000.0,
+            60_000_000,
+            0.35,
+            6,
+            6,
+        ));
+    }
+
+    #[test]
+    fn sell_rotation_holds_when_sell_side_capital_is_warehoused() {
+        assert!(should_hold_buy_scan_for_sell_rotation(
+            5,
+            16_600_000.0,
+            16_800_000.0,
+            60_000_000,
+            0.28,
+            6,
+            6,
+        ));
+    }
+
+    #[test]
+    fn sell_consolidation_required_for_duplicate_or_partial_same_item_sell() {
+        assert!(should_consolidate_sell_orders(180, 180, 2));
+        assert!(should_consolidate_sell_orders(180, 64, 1));
+        assert!(!should_consolidate_sell_orders(180, 180, 1));
+        assert!(!should_consolidate_sell_orders(180, 0, 0));
     }
 
     #[test]

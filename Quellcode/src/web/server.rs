@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -17,6 +17,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::bazaar_tracker::BazaarOrderTracker;
@@ -62,7 +63,8 @@ pub struct WebSharedState {
     /// Timestamp when the bot process started (for uptime tracking).
     pub started_at: std::time::Instant,
     /// Accumulated running time from previous sessions (seconds).
-    /// Added to `started_at.elapsed()` to get total uptime across restarts.
+    /// Kept for account/session bookkeeping; user-facing profit/h uses only
+    /// the current process runtime so a manual stop/restart resets the average.
     pub previous_session_secs: u64,
     /// Hypixel API key for fetching active auctions (optional).
     pub hypixel_api_key: Option<String>,
@@ -157,6 +159,31 @@ struct ProfitResponse {
     bz_total: i64,
     uptime_seconds: u64,
     bazaar_audit: crate::bazaar_tracker::BazaarProfitAuditSnapshot,
+}
+
+#[derive(Serialize)]
+struct DiagnosticsResponse {
+    target_profit_per_hour: f64,
+    actual_realized_profit_per_hour: f64,
+    realized_fifo_profit_total: i64,
+    main_bottleneck: String,
+    secondary_bottlenecks: Vec<String>,
+    recommended_changes: BTreeMap<String, serde_json::Value>,
+    average_capital_locked: f64,
+    capital_turnover_score: f64,
+    open_buy_capital: f64,
+    open_sell_value: f64,
+    cost_lot_value: f64,
+    active_buy_orders: usize,
+    active_sell_orders: usize,
+    stale_buy_orders: usize,
+    stale_sell_orders: usize,
+    sell_queue_length: usize,
+    sell_queue_blocked_count: usize,
+    sell_queue_last_action: String,
+    sell_queue_last_block_reason: Option<String>,
+    unknown_cost_basis_count: u64,
+    ignored_legacy_profit_total: i64,
 }
 
 /// Default auction duration used when the client doesn't provide one.
@@ -317,6 +344,7 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/config", get(get_config).post(save_config))
         .route("/api/logs/latest", get(download_latest_log))
         .route("/api/profit", get(get_profit))
+        .route("/api/diagnostics", get(get_diagnostics))
         .route("/api/kill_session", axum::routing::post(kill_session))
         .route("/api/disconnect", axum::routing::post(disconnect_session))
         .route("/api/connect", axum::routing::post(connect_session))
@@ -341,11 +369,29 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         );
     }
 
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!("Failed to bind web server on {}: {}", addr, e);
-            return;
+    let mut attempts = 0u32;
+    let listener = loop {
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => break listener,
+            Err(e) => {
+                attempts += 1;
+                error!(
+                    "Failed to bind web server on {}: {} (attempt {}/12)",
+                    addr, e, attempts
+                );
+                warn!(
+                    "[BAF][RECOVERY] web_server_bind_retry addr={} attempt={} reason={}",
+                    addr, attempts, e
+                );
+                if attempts >= 12 {
+                    error!(
+                        "[BAF][RECOVERY] web_server_bind_failed addr={} attempts={} action=api_unavailable",
+                        addr, attempts
+                    );
+                    return;
+                }
+                sleep(Duration::from_secs(5)).await;
+            }
         }
     };
 
@@ -388,7 +434,7 @@ fn format_og_uptime(secs: u64) -> String {
 async fn index_page(State(s): State<WebSharedState>) -> Html<String> {
     let (ah_total, bz_total) = s.profit_tracker.totals();
     let total = ah_total + bz_total;
-    let uptime = s.previous_session_secs + s.started_at.elapsed().as_secs();
+    let uptime = current_run_uptime_seconds(s.started_at);
     let hours = uptime as f64 / 3600.0;
     let per_hour = if hours > 0.0 {
         total as f64 / hours
@@ -512,7 +558,7 @@ async fn get_status(State(s): State<WebSharedState>) -> Json<StatusResponse> {
         current_account_index: s.current_account_index,
         accounts,
         purse: s.bot_client.get_purse(),
-        uptime_seconds: s.previous_session_secs + s.started_at.elapsed().as_secs(),
+        uptime_seconds: current_run_uptime_seconds(s.started_at),
         bazaar_at_limit: s.bot_client.is_bazaar_at_limit(),
         auction_at_limit: s.bot_client.is_auction_at_limit(),
         inventory_full: s.bot_client.is_inventory_full(),
@@ -1585,9 +1631,210 @@ async fn get_profit(State(s): State<WebSharedState>) -> Json<ProfitResponse> {
         bz_points: s.profit_tracker.bz_points(),
         ah_total,
         bz_total,
-        uptime_seconds: s.previous_session_secs + s.started_at.elapsed().as_secs(),
+        uptime_seconds: current_run_uptime_seconds(s.started_at),
         bazaar_audit: s.bazaar_tracker.profit_audit_snapshot(),
     })
+}
+
+async fn get_diagnostics(State(s): State<WebSharedState>) -> Json<DiagnosticsResponse> {
+    let config = s.config_loader.load().unwrap_or_default();
+    let (_, bz_total) = s.profit_tracker.totals();
+    let uptime_seconds = current_run_uptime_seconds(s.started_at);
+    let actual_profit_per_hour = realized_profit_per_hour(bz_total, uptime_seconds);
+    let audit = s.bazaar_tracker.profit_audit_snapshot();
+    let average_capital_locked =
+        audit.open_buy_capital + audit.remaining_cost_lot_value + audit.open_sell_value.max(0.0);
+    let significant_sell_lock =
+        audit.remaining_cost_lot_value >= (500_000.0f64).max(average_capital_locked * 0.15);
+    let capital_turnover_score = if average_capital_locked > 0.0 {
+        actual_profit_per_hour / average_capital_locked
+    } else {
+        0.0
+    };
+
+    let max_open_buy_capital =
+        config.local_bazaar_total_capital as f64 * config.local_bazaar_max_open_buy_capital_ratio;
+    let sell_queue_backlog = !audit.items_waiting_for_sell.is_empty()
+        || (audit.actionable_cost_lot_value > 0.0 && audit.active_sell_orders == 0);
+
+    let mut bottlenecks = Vec::new();
+    let mut recommended_changes = BTreeMap::new();
+    let product_lookup_failure_count = audit
+        .item_performance
+        .keys()
+        .filter(|p| {
+            s.bazaar_tracker
+                .item_cooldown_reason(p)
+                .map(|(_, reason)| reason == "PRODUCT_LOOKUP_FAILED")
+                .unwrap_or(false)
+        })
+        .count();
+
+    if sell_queue_backlog {
+        bottlenecks.push("SELL_QUEUE_BACKLOG".to_string());
+        recommended_changes.insert(
+            "local_bazaar_cancel_stale_buys_when_sell_queue_pending".to_string(),
+            serde_json::json!(true),
+        );
+    }
+    if audit.active_buy_orders > 0
+        && audit.open_buy_capital > 0.0
+        && actual_profit_per_hour < config.local_bazaar_target_profit_per_hour * 0.5
+        && uptime_seconds >= 600
+    {
+        bottlenecks.push("BUY_FILL_TOO_SLOW".to_string());
+        recommended_changes.insert(
+            "local_bazaar_stale_buy_max_age_seconds".to_string(),
+            serde_json::json!(config
+                .local_bazaar_stale_buy_max_age_seconds
+                .saturating_sub(120)
+                .max(300)),
+        );
+    }
+    if audit.active_sell_orders > 0
+        && significant_sell_lock
+        && actual_profit_per_hour < config.local_bazaar_target_profit_per_hour * 0.5
+    {
+        bottlenecks.push("WAITING_FOR_SELL_FILL".to_string());
+        recommended_changes.insert(
+            "local_bazaar_min_sell_volume".to_string(),
+            serde_json::json!((config.local_bazaar_min_sell_volume as f64 * 1.1).round() as u64),
+        );
+    }
+    if audit.remaining_cost_lot_value > max_open_buy_capital * 0.5
+        && actual_profit_per_hour < config.local_bazaar_target_profit_per_hour * 0.6
+    {
+        bottlenecks.push("CAPITAL_LOCK".to_string());
+        recommended_changes.insert(
+            "local_bazaar_per_item_exposure_cap".to_string(),
+            serde_json::json!(
+                (config.local_bazaar_per_item_exposure_cap as f64 * 0.85).round() as u64
+            ),
+        );
+        recommended_changes.insert(
+            "local_bazaar_max_order_value".to_string(),
+            serde_json::json!((config.local_bazaar_max_order_value as f64 * 0.85).round() as u64),
+        );
+    }
+    if !audit.blocked_items_waiting_for_sell.is_empty() {
+        bottlenecks.push("BLOCKED_COST_LOTS".to_string());
+        recommended_changes.insert(
+            "cooldown_blocked_cost_lot_items".to_string(),
+            serde_json::json!(audit.blocked_items_waiting_for_sell.clone()),
+        );
+    }
+    if audit.stale_sell_orders > 0 {
+        bottlenecks.push("SELL_FILL_TOO_SLOW".to_string());
+        recommended_changes.insert(
+            "local_bazaar_min_sell_volume".to_string(),
+            serde_json::json!((config.local_bazaar_min_sell_volume as f64 * 1.15).round() as u64),
+        );
+        recommended_changes.insert(
+            "local_bazaar_max_margin_percent".to_string(),
+            serde_json::json!((config.local_bazaar_max_margin_percent * 0.9).max(1.0)),
+        );
+    }
+    if audit.stale_buy_orders > config.local_bazaar_max_stale_buy_orders {
+        bottlenecks.push("STALE_BUY_PRESSURE".to_string());
+        recommended_changes.insert(
+            "local_bazaar_pause_new_buys_when_stale_buy_pressure".to_string(),
+            serde_json::json!(true),
+        );
+    }
+    if product_lookup_failure_count > 0 {
+        bottlenecks.push("PRODUCT_LOOKUP_FAILURES".to_string());
+        recommended_changes.insert(
+            "exclude_recent_product_lookup_failures".to_string(),
+            serde_json::json!(true),
+        );
+    }
+    if audit.open_buy_capital >= max_open_buy_capital * 0.95 {
+        bottlenecks.push("TOO_MUCH_OPEN_BUY_CAPITAL".to_string());
+        recommended_changes.insert(
+            "local_bazaar_max_open_buy_capital_ratio".to_string(),
+            serde_json::json!((config.local_bazaar_max_open_buy_capital_ratio * 0.9).max(0.1)),
+        );
+    }
+    if audit.active_buy_orders >= config.local_bazaar_max_concurrent_orders
+        && actual_profit_per_hour < config.local_bazaar_target_profit_per_hour * 0.5
+    {
+        bottlenecks.push("BUY_FILL_TOO_SLOW".to_string());
+        recommended_changes.insert(
+            "local_bazaar_stale_buy_max_age_seconds".to_string(),
+            serde_json::json!(config.local_bazaar_stale_buy_max_age_seconds.min(900)),
+        );
+    }
+    if bottlenecks.is_empty()
+        && actual_profit_per_hour < config.local_bazaar_target_profit_per_hour
+        && audit.open_buy_capital < max_open_buy_capital * 0.5
+        && audit.remaining_cost_lot_value <= 0.0
+    {
+        bottlenecks.push("TOO_FEW_GOOD_CANDIDATES_OR_WAITING_FOR_FILLS".to_string());
+        recommended_changes.insert(
+            "local_bazaar_min_total_profit".to_string(),
+            serde_json::json!((config.local_bazaar_min_total_profit * 0.9).round()),
+        );
+        recommended_changes.insert(
+            "local_bazaar_min_roi_percent".to_string(),
+            serde_json::json!((config.local_bazaar_min_roi_percent * 0.95).max(0.1)),
+        );
+    }
+    if bottlenecks.is_empty() {
+        bottlenecks.push(
+            if uptime_seconds < 900 {
+                "INSUFFICIENT_RUNTIME_DATA"
+            } else if average_capital_locked > 0.0
+                && actual_profit_per_hour < config.local_bazaar_target_profit_per_hour
+            {
+                "CAPITAL_TIED_WAITING_FOR_CYCLE"
+            } else {
+                "ON_TRACK"
+            }
+            .to_string(),
+        );
+    }
+
+    let main_bottleneck = bottlenecks
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "UNKNOWN".to_string());
+    let secondary_bottlenecks = bottlenecks.into_iter().skip(1).collect();
+
+    Json(DiagnosticsResponse {
+        target_profit_per_hour: config.local_bazaar_target_profit_per_hour,
+        actual_realized_profit_per_hour: actual_profit_per_hour,
+        realized_fifo_profit_total: bz_total,
+        main_bottleneck,
+        secondary_bottlenecks,
+        recommended_changes,
+        average_capital_locked,
+        capital_turnover_score,
+        open_buy_capital: audit.open_buy_capital,
+        open_sell_value: audit.open_sell_value,
+        cost_lot_value: audit.remaining_cost_lot_value,
+        active_buy_orders: audit.active_buy_orders,
+        active_sell_orders: audit.active_sell_orders,
+        stale_buy_orders: audit.stale_buy_orders,
+        stale_sell_orders: audit.stale_sell_orders,
+        sell_queue_length: audit.items_waiting_for_sell.len(),
+        sell_queue_blocked_count: audit.blocked_items_waiting_for_sell.len(),
+        sell_queue_last_action: audit.cleanup_state,
+        sell_queue_last_block_reason: audit.last_sell_audit.and_then(|audit| audit.reason),
+        unknown_cost_basis_count: audit.unknown_cost_basis_sell_total_count,
+        ignored_legacy_profit_total: audit.ignored_legacy_profit_total,
+    })
+}
+
+fn realized_profit_per_hour(realized_profit: i64, uptime_seconds: u64) -> f64 {
+    if uptime_seconds == 0 {
+        0.0
+    } else {
+        realized_profit as f64 * 3600.0 / uptime_seconds as f64
+    }
+}
+
+fn current_run_uptime_seconds(started_at: std::time::Instant) -> u64 {
+    started_at.elapsed().as_secs()
 }
 
 /// Public profit endpoint — no authentication required.
@@ -1596,7 +1843,7 @@ async fn get_profit(State(s): State<WebSharedState>) -> Json<ProfitResponse> {
 async fn get_profit_public(State(s): State<WebSharedState>) -> Json<PublicProfitResponse> {
     let (ah_total, bz_total) = s.profit_tracker.totals();
     let total = ah_total + bz_total;
-    let uptime = s.previous_session_secs + s.started_at.elapsed().as_secs();
+    let uptime = current_run_uptime_seconds(s.started_at);
     let hours = uptime as f64 / 3600.0;
     let per_hour = if hours > 0.0 {
         total as f64 / hours
@@ -1619,7 +1866,7 @@ async fn get_profit_public(State(s): State<WebSharedState>) -> Json<PublicProfit
 async fn get_og_image(State(s): State<WebSharedState>) -> impl IntoResponse {
     let (ah_total, bz_total) = s.profit_tracker.totals();
     let total = ah_total + bz_total;
-    let uptime = s.previous_session_secs + s.started_at.elapsed().as_secs();
+    let uptime = current_run_uptime_seconds(s.started_at);
     let hours = uptime as f64 / 3600.0;
     let per_hour = if hours > 0.0 {
         total as f64 / hours
@@ -1739,5 +1986,17 @@ mod tests {
         assert!(entries[0].bin);
         assert!(entries[0].tag.is_some());
         assert_eq!(entries[0].tag.as_deref(), Some("DIAMOND_SWORD"));
+    }
+
+    #[test]
+    fn realized_profit_per_hour_uses_elapsed_run_time() {
+        let pph = realized_profit_per_hour(4_000_000, 6480);
+        assert!((pph - 2_222_222.22).abs() < 1.0);
+    }
+
+    #[test]
+    fn current_run_uptime_starts_at_process_start() {
+        let started = std::time::Instant::now();
+        assert!(current_run_uptime_seconds(started) <= 1);
     }
 }

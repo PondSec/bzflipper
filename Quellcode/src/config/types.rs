@@ -223,6 +223,16 @@ pub struct Config {
     pub local_bazaar_max_reprices_per_item_per_hour: u64,
     #[serde(default = "default_local_bazaar_reprice_cooldown_seconds")]
     pub local_bazaar_reprice_cooldown_seconds: u64,
+    #[serde(default = "default_local_bazaar_max_stale_buy_orders")]
+    pub local_bazaar_max_stale_buy_orders: usize,
+    #[serde(default = "default_local_bazaar_stale_buy_max_age_seconds")]
+    pub local_bazaar_stale_buy_max_age_seconds: u64,
+    #[serde(default = "default_local_bazaar_stale_sell_max_age_seconds")]
+    pub local_bazaar_stale_sell_max_age_seconds: u64,
+    #[serde(default = "default_true")]
+    pub local_bazaar_pause_new_buys_when_stale_buy_pressure: bool,
+    #[serde(default = "default_true")]
+    pub local_bazaar_cancel_stale_buys_when_sell_queue_pending: bool,
 
     /// Prefer/allow classic high-liquidity potato book flips.
     #[serde(default = "default_true", alias = "classic_potato_book_flips")]
@@ -536,6 +546,18 @@ fn default_local_bazaar_reprice_cooldown_seconds() -> u64 {
     360
 }
 
+fn default_local_bazaar_max_stale_buy_orders() -> usize {
+    2
+}
+
+fn default_local_bazaar_stale_buy_max_age_seconds() -> u64 {
+    900
+}
+
+fn default_local_bazaar_stale_sell_max_age_seconds() -> u64 {
+    2_700
+}
+
 fn default_auction_listing_delay_ms() -> u64 {
     1500
 }
@@ -630,6 +652,13 @@ impl Default for Config {
             local_bazaar_max_reprices_per_item_per_hour:
                 default_local_bazaar_max_reprices_per_item_per_hour(),
             local_bazaar_reprice_cooldown_seconds: default_local_bazaar_reprice_cooldown_seconds(),
+            local_bazaar_max_stale_buy_orders: default_local_bazaar_max_stale_buy_orders(),
+            local_bazaar_stale_buy_max_age_seconds: default_local_bazaar_stale_buy_max_age_seconds(
+            ),
+            local_bazaar_stale_sell_max_age_seconds:
+                default_local_bazaar_stale_sell_max_age_seconds(),
+            local_bazaar_pause_new_buys_when_stale_buy_pressure: true,
+            local_bazaar_cancel_stale_buys_when_sell_queue_pending: true,
             enable_classic_potato_book_flips: true,
             auction_listing_delay_ms: default_auction_listing_delay_ms(),
             enable_bazaar_flips: true,

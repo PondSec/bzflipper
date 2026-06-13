@@ -19,6 +19,13 @@ const ORDERS_FILE: &str = "bazaar_orders.json";
 const LEGACY_BUY_COSTS_FILE: &str = "bazaar_buy_costs.json";
 /// File name for persisted FIFO buy-cost lots.
 const BUY_COST_LOTS_FILE: &str = "bazaar_buy_cost_lots.json";
+/// File name for per-item runtime performance and cooldown state.
+const ITEM_PERFORMANCE_FILE: &str = "bazaar_item_performance.json";
+/// Planned SELL order escrows are only a short bridge until the in-game order
+/// appears in Manage Orders. A longer lifetime can pin FIFO lots after a failed
+/// command and stall the whole sell-first lifecycle.
+const PLANNED_LOCAL_SELL_ORDER_TTL_SECONDS: u64 = 120;
+const PRODUCT_LOOKUP_FAILURE_COOLDOWN_SECONDS: u64 = 120;
 
 /// A single tracked bazaar order visible on the web panel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +122,7 @@ pub struct ItemPerformance {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CostBasisStatus {
     Known,
+    PartialKnownCostBasis,
     UnknownCostBasis,
 }
 
@@ -122,6 +130,7 @@ impl CostBasisStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Known => "KNOWN",
+            Self::PartialKnownCostBasis => "PARTIAL_KNOWN_COST_BASIS",
             Self::UnknownCostBasis => "UNKNOWN_COST_BASIS",
         }
     }
@@ -156,6 +165,9 @@ pub struct BazaarProfitAuditSnapshot {
     pub stale_buy_orders: usize,
     pub stale_sell_orders: usize,
     pub items_waiting_for_sell: Vec<String>,
+    pub blocked_items_waiting_for_sell: Vec<String>,
+    pub blocked_cost_lot_value: f64,
+    pub actionable_cost_lot_value: f64,
     pub last_sell_audit_at: Option<u64>,
     pub web_graph_source: String,
     pub last_sell_audit: Option<SellProfitAudit>,
@@ -183,8 +195,11 @@ pub struct BazaarOrderTracker {
     bz_list_profits: Arc<RwLock<HashMap<String, (i64, u32)>>>,
     profit_audit: Arc<RwLock<BazaarProfitAuditState>>,
     /// SELL order targets created by the local Hypixel Bazaar scanner.
-    /// Maps normalized item name → (target_sell_price_per_unit, item_tag, planned_amount).
-    planned_local_sells: Arc<RwLock<HashMap<String, (f64, Option<String>, Option<u64>)>>>,
+    /// Maps normalized item name → (target_sell_price_per_unit, item_tag, planned_amount, recorded_at).
+    planned_local_sells: Arc<RwLock<HashMap<String, (f64, Option<String>, Option<u64>, u64)>>>,
+    /// SELL fills that were already accounted locally but may still appear as
+    /// the original amount in the next Manage Orders snapshot.
+    recently_collected_sell_fills: Arc<RwLock<HashMap<String, u64>>>,
     item_performance: Arc<RwLock<HashMap<String, ItemPerformance>>>,
     end_phase_state: Arc<RwLock<String>>,
 }
@@ -197,6 +212,7 @@ impl BazaarOrderTracker {
             bz_list_profits: Arc::new(RwLock::new(HashMap::new())),
             profit_audit: Arc::new(RwLock::new(BazaarProfitAuditState::default())),
             planned_local_sells: Arc::new(RwLock::new(HashMap::new())),
+            recently_collected_sell_fills: Arc::new(RwLock::new(HashMap::new())),
             item_performance: Arc::new(RwLock::new(HashMap::new())),
             end_phase_state: Arc::new(RwLock::new("IDLE".to_string())),
         };
@@ -214,6 +230,7 @@ impl BazaarOrderTracker {
             bz_list_profits: Arc::new(RwLock::new(HashMap::new())),
             profit_audit: Arc::new(RwLock::new(BazaarProfitAuditState::default())),
             planned_local_sells: Arc::new(RwLock::new(HashMap::new())),
+            recently_collected_sell_fills: Arc::new(RwLock::new(HashMap::new())),
             item_performance: Arc::new(RwLock::new(HashMap::new())),
             end_phase_state: Arc::new(RwLock::new("IDLE".to_string())),
         }
@@ -282,9 +299,121 @@ impl BazaarOrderTracker {
         result
     }
 
+    /// Remove the oldest matching open/filled order. ManageOrders cancels stale
+    /// orders by walking the in-game order list; when multiple same-item orders
+    /// exist, removing the newest tracker entry leaves the stale one behind and
+    /// causes cancel/relist churn.
+    pub fn remove_oldest_order(
+        &self,
+        item_name: &str,
+        is_buy_order: bool,
+    ) -> Option<TrackedBazaarOrder> {
+        let mut orders = self.orders.write();
+        let target = normalize_for_match(item_name);
+        let result = orders
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| {
+                (o.status == "open" || o.status == "filled")
+                    && o.is_buy_order == is_buy_order
+                    && normalize_for_match(&o.item_name) == target
+            })
+            .min_by_key(|(_, o)| o.placed_at)
+            .map(|(idx, _)| idx)
+            .map(|pos| orders.remove(pos));
+        drop(orders);
+        self.save_orders_to_disk();
+        result
+    }
+
+    /// Remove the collected portion of an order and keep any unfilled remainder
+    /// tracked as open. Bazaar orders can be partially claimable before the
+    /// whole order has filled; removing the full order at that point
+    /// underreports locked capital and breaks the buy/sell lifecycle.
+    pub fn remove_or_reduce_order_on_collect(
+        &self,
+        item_name: &str,
+        is_buy_order: bool,
+        claimed_amount: Option<u64>,
+    ) -> Option<TrackedBazaarOrder> {
+        let mut orders = self.orders.write();
+        let result = if let Some(pos) = orders.iter().rposition(|o| {
+            (o.status == "open" || o.status == "filled")
+                && o.is_buy_order == is_buy_order
+                && normalize_for_match(&o.item_name) == normalize_for_match(item_name)
+        }) {
+            let tracked_amount = orders[pos].amount;
+            let collected_amount = claimed_amount
+                .filter(|amount| *amount > 0)
+                .unwrap_or(tracked_amount)
+                .min(tracked_amount);
+            let mut collected = orders[pos].clone();
+            collected.amount = collected_amount;
+
+            if collected_amount < tracked_amount {
+                orders[pos].amount = tracked_amount - collected_amount;
+                orders[pos].status = "open".to_string();
+            } else {
+                orders.remove(pos);
+            }
+            if !is_buy_order && collected_amount > 0 {
+                *self
+                    .recently_collected_sell_fills
+                    .write()
+                    .entry(normalize_for_match(item_name))
+                    .or_insert(0) += collected_amount;
+            }
+            Some(collected)
+        } else {
+            None
+        };
+        drop(orders);
+        self.save_orders_to_disk();
+        result
+    }
+
     /// Return a snapshot of all tracked orders.
     pub fn get_orders(&self) -> Vec<TrackedBazaarOrder> {
         self.orders.read().clone()
+    }
+
+    pub fn filled_order_count(&self, is_buy_order: bool) -> usize {
+        self.orders
+            .read()
+            .iter()
+            .filter(|o| o.is_buy_order == is_buy_order && o.status == "filled")
+            .count()
+    }
+
+    pub fn stale_order_count(&self, is_buy_order: bool, max_age_secs: u64) -> usize {
+        let now = Self::now_secs();
+        self.orders
+            .read()
+            .iter()
+            .filter(|o| {
+                o.is_buy_order == is_buy_order
+                    && (o.status == "open" || o.status == "filled")
+                    && now.saturating_sub(o.placed_at) >= max_age_secs
+            })
+            .count()
+    }
+
+    pub fn oldest_stale_order(
+        &self,
+        is_buy_order: bool,
+        max_age_secs: u64,
+    ) -> Option<TrackedBazaarOrder> {
+        let now = Self::now_secs();
+        self.orders
+            .read()
+            .iter()
+            .filter(|o| {
+                o.is_buy_order == is_buy_order
+                    && (o.status == "open" || o.status == "filled")
+                    && now.saturating_sub(o.placed_at) >= max_age_secs
+            })
+            .min_by_key(|o| o.placed_at)
+            .cloned()
     }
 
     /// Remove all tracked orders and persist.  Used on startup to get a clean
@@ -329,6 +458,9 @@ impl BazaarOrderTracker {
     /// tuples taken from the Bazaar Orders window during a ManageOrders cycle.
     /// Any tracked order whose item+type does **not** appear in this list is
     /// removed so the web panel stays in sync with the actual in-game state.
+    /// Sell orders backed by FIFO CostLots are preserved across missing
+    /// snapshots because listed items are held in Bazaar escrow until claim or
+    /// cancel confirms their final state.
     ///
     /// Orders visible in-game but NOT yet tracked (e.g. placed before the bot
     /// started, or placed manually) are added as new entries so the web panel
@@ -370,12 +502,22 @@ impl BazaarOrderTracker {
                 .or_default()
                 .push((*amount, *price_per_unit));
         }
+        let fifo_amount_by_item: std::collections::HashMap<String, u64> = self
+            .buy_cost_lots
+            .read()
+            .iter()
+            .map(|(item, lots)| (item.clone(), lots.iter().map(|lot| lot.amount).sum::<u64>()))
+            .collect();
+        let mut unaccounted_buy_fills_by_item = fifo_amount_by_item.clone();
+        let now = Self::now_secs();
         let mut orders = self.orders.write();
+        let mut recently_collected_sell_fills = self.recently_collected_sell_fills.write();
         let original_len = orders.len();
         // Track how many of each (item, side) we have already kept so we
         // don't exceed the in-game count.
         let mut kept_counts: std::collections::HashMap<(String, bool), usize> =
             std::collections::HashMap::new();
+        let mut preserved_fifo_sell_orders = 0usize;
         orders.retain_mut(|o| {
             let key = (normalize_for_match(&o.item_name), o.is_buy_order);
             let allowed = ingame_counts.get(&key).copied().unwrap_or(0);
@@ -386,13 +528,56 @@ impl BazaarOrderTracker {
                     .and_then(|rows| rows.get(*kept))
                     .copied()
                 {
-                    if amount > 0 {
-                        o.amount = amount;
+                    let mut reconciled_amount = amount;
+                    if o.is_buy_order {
+                        if let Some(already_collected) =
+                            unaccounted_buy_fills_by_item.get_mut(&key.0)
+                        {
+                            let offset = (*already_collected).min(reconciled_amount);
+                            if offset > 0 {
+                                reconciled_amount = reconciled_amount.saturating_sub(offset);
+                                *already_collected -= offset;
+                                debug!(
+                                    "[BAF][PARTIAL_BUY_RECONCILE] item={} ingame_amount={} already_collected_fifo_amount={} open_amount={}",
+                                    o.item_name, amount, offset, reconciled_amount
+                                );
+                            }
+                        }
+                    } else if let Some(already_collected) =
+                        recently_collected_sell_fills.get_mut(&key.0)
+                    {
+                        if reconciled_amount > o.amount {
+                            let overreported_amount = reconciled_amount - o.amount;
+                            let offset = (*already_collected).min(overreported_amount);
+                            if offset > 0 {
+                                reconciled_amount = reconciled_amount.saturating_sub(offset);
+                                *already_collected -= offset;
+                                debug!(
+                                    "[BAF][PARTIAL_SELL_RECONCILE] item={} ingame_amount={} tracked_open_amount={} already_collected_sell_amount={} open_amount={}",
+                                    o.item_name, amount, o.amount, offset, reconciled_amount
+                                );
+                            }
+                        } else {
+                            *already_collected = 0;
+                        }
+                    }
+                    if reconciled_amount > 0 {
+                        o.amount = reconciled_amount;
                     }
                     if price_per_unit > 0.0 {
+                        if (o.price_per_unit - price_per_unit).abs() > 0.01 {
+                            o.placed_at = now;
+                        }
                         o.price_per_unit = price_per_unit;
                     }
                 }
+                *kept += 1;
+                true
+            } else if !o.is_buy_order && fifo_amount_by_item.get(&key.0).copied().unwrap_or(0) > 0 {
+                // A just-listed sell offer moves items into Bazaar escrow, so a
+                // transient or incomplete Manage Orders snapshot must not make
+                // us drop the sell-side bridge needed for FIFO profit claiming.
+                preserved_fifo_sell_orders += 1;
                 *kept += 1;
                 true
             } else {
@@ -403,10 +588,6 @@ impl BazaarOrderTracker {
 
         // Add in-game orders that aren't already tracked.
         // Iterate over unique keys to avoid duplicate additions.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         let mut added = 0usize;
 
         // Build a map from (normalized_name, is_buy) → Vec<(amount, price)>
@@ -427,7 +608,35 @@ impl BazaarOrderTracker {
             let tracked = kept_counts.get(key).copied().unwrap_or(0);
             let needed = data_entries.len();
             for idx in tracked..needed {
-                let (amount, price) = data_entries[idx];
+                let (mut amount, price) = data_entries[idx];
+                if key.1 {
+                    if let Some(already_collected) = unaccounted_buy_fills_by_item.get_mut(&key.0) {
+                        let offset = (*already_collected).min(amount);
+                        if offset > 0 {
+                            amount = amount.saturating_sub(offset);
+                            *already_collected -= offset;
+                            debug!(
+                                "[BAF][PARTIAL_BUY_RECONCILE] item={} ingame_amount={} already_collected_fifo_amount={} open_amount={}",
+                                key.0, data_entries[idx].0, offset, amount
+                            );
+                        }
+                    }
+                } else if let Some(already_collected) =
+                    recently_collected_sell_fills.get_mut(&key.0)
+                {
+                    let offset = (*already_collected).min(amount);
+                    if offset > 0 {
+                        amount = amount.saturating_sub(offset);
+                        *already_collected -= offset;
+                        debug!(
+                            "[BAF][PARTIAL_SELL_RECONCILE] item={} ingame_amount={} already_collected_sell_amount={} open_amount={}",
+                            key.0, data_entries[idx].0, offset, amount
+                        );
+                    }
+                }
+                if amount == 0 {
+                    continue;
+                }
                 // Use title case for the item name from the first matching ingame order
                 let display_name = ingame_orders
                     .iter()
@@ -448,7 +657,15 @@ impl BazaarOrderTracker {
         }
 
         drop(orders);
+        recently_collected_sell_fills.retain(|_, amount| *amount > 0);
+        drop(recently_collected_sell_fills);
         if removed > 0 || added > 0 {
+            if preserved_fifo_sell_orders > 0 {
+                warn!(
+                    "[BAF][SELL_ESCROW_GUARD] preserved {} sell order(s) with FIFO CostLots despite missing in-game snapshot",
+                    preserved_fifo_sell_orders
+                );
+            }
             if added > 0 {
                 debug!(
                     "[BazaarTracker] Added {} in-game orders not previously tracked",
@@ -472,16 +689,19 @@ impl BazaarOrderTracker {
         F: FnOnce(&mut ItemPerformance),
     {
         let key = normalize_for_match(item_name);
-        let mut map = self.item_performance.write();
-        let perf = map.entry(key.clone()).or_insert_with(|| ItemPerformance {
-            item_name: item_name.to_string(),
-            product_id: key.clone(),
-            ..Default::default()
-        });
-        if perf.item_name.is_empty() {
-            perf.item_name = item_name.to_string();
+        {
+            let mut map = self.item_performance.write();
+            let perf = map.entry(key.clone()).or_insert_with(|| ItemPerformance {
+                item_name: item_name.to_string(),
+                product_id: key.clone(),
+                ..Default::default()
+            });
+            if perf.item_name.is_empty() {
+                perf.item_name = item_name.to_string();
+            }
+            f(perf);
         }
-        f(perf);
+        self.save_item_performance_to_disk();
     }
 
     pub fn set_end_phase_state(&self, state: impl Into<String>) {
@@ -517,6 +737,87 @@ impl BazaarOrderTracker {
             })
             .map(|o| o.price_per_unit * o.amount as f64)
             .sum()
+    }
+
+    pub fn item_cooldown_reason(&self, item_name: &str) -> Option<(u64, String)> {
+        let key = normalize_for_match(item_name);
+        let now = Self::now_secs();
+        let map = self.item_performance.read();
+        let perf = map.get(&key)?;
+        let until = perf.cooldown_until?;
+        let reason = perf
+            .block_reason
+            .clone()
+            .unwrap_or_else(|| "ITEM_COOLDOWN".to_string());
+        let effective_until = if reason == "PRODUCT_LOOKUP_FAILED" {
+            perf.last_failure_timestamp
+                .map(|ts| ts + PRODUCT_LOOKUP_FAILURE_COOLDOWN_SECONDS)
+                .unwrap_or(until)
+                .min(until)
+        } else {
+            until
+        };
+        if effective_until <= now {
+            return None;
+        }
+        Some((effective_until, reason))
+    }
+
+    pub fn active_buy_order_on_cooldown(&self) -> Option<(String, String, u64)> {
+        let orders = self.orders.read();
+        for order in orders.iter().filter(|order| {
+            order.is_buy_order && (order.status == "open" || order.status == "filled")
+        }) {
+            if let Some((until, reason)) = self.item_cooldown_reason(&order.item_name) {
+                return Some((order.item_name.clone(), reason, until));
+            }
+        }
+        None
+    }
+
+    pub fn cooldown_item(&self, item_name: &str, reason: &str, cooldown_seconds: u64) {
+        let cooldown_seconds = cooldown_seconds.max(60);
+        let normalized_reason = reason.trim().to_ascii_uppercase();
+        self.update_performance(item_name, |p| {
+            let now = Self::now_secs();
+            let until = now.saturating_add(cooldown_seconds);
+            p.cooldown_until = Some(p.cooldown_until.unwrap_or(0).max(until));
+            p.block_reason = Some(normalized_reason.clone());
+            p.last_failure_timestamp = Some(now);
+        });
+        warn!(
+            "[BAF][ITEM_COOLDOWN] item={} reason={} action=manual_cooldown cooldown_seconds={}",
+            item_name, normalized_reason, cooldown_seconds
+        );
+    }
+
+    pub fn record_product_lookup_failed(&self, item_name: &str, reason: &str) {
+        self.planned_local_sells
+            .write()
+            .remove(&normalize_for_match(item_name));
+        let normalized_reason = if reason.trim().is_empty() {
+            "PRODUCT_LOOKUP_FAILED"
+        } else {
+            reason.trim()
+        };
+        let now = Self::now_secs();
+        self.update_performance(item_name, |p| {
+            p.failed_search_count += 1;
+            p.failed_flips += 1;
+            p.last_failure_timestamp = Some(now);
+            p.cooldown_until = Some(now + PRODUCT_LOOKUP_FAILURE_COOLDOWN_SECONDS);
+            p.block_reason = Some(normalized_reason.to_string());
+        });
+        warn!(
+            "[BAF][ITEM_COOLDOWN] item={} reason={} action=product_lookup_failed cooldown_seconds={}",
+            item_name, normalized_reason, PRODUCT_LOOKUP_FAILURE_COOLDOWN_SECONDS
+        );
+    }
+
+    pub fn record_reprice(&self, item_name: &str) {
+        self.update_performance(item_name, |p| {
+            p.reprice_count += 1;
+        });
     }
 
     pub fn peek_fifo_cost_basis(&self, item_name: &str, amount: u64) -> Option<f64> {
@@ -629,9 +930,11 @@ impl BazaarOrderTracker {
         self.save_buy_cost_lots_to_disk();
     }
 
-    /// Consume FIFO lots for a SELL collection and return a complete audit row.
-    /// If not enough locally collected BUY lots exist, nothing is consumed and
-    /// the sell is marked `UNKNOWN_COST_BASIS`; its realized profit is zero.
+    /// Consume known FIFO lots for a SELL collection and return a complete audit row.
+    /// Mixed claims can contain more sold items than locally known BUY lots when
+    /// old inventory and tracked flips are collected together. In that case only
+    /// the known FIFO-backed portion is realized; the unknown remainder is
+    /// audited but never counted as profit.
     pub fn account_sell_collect(
         &self,
         item_name: &str,
@@ -640,6 +943,7 @@ impl BazaarOrderTracker {
         gross_list_value: Option<f64>,
     ) -> SellProfitAudit {
         let key = normalize_for_match(item_name);
+        self.planned_local_sells.write().remove(&key);
         let available: u64 = self
             .buy_cost_lots
             .read()
@@ -647,9 +951,19 @@ impl BazaarOrderTracker {
             .map(|lots| lots.iter().map(|lot| lot.amount).sum())
             .unwrap_or(0);
 
-        if sold_amount == 0 || available < sold_amount {
+        if sold_amount == 0
+            || available == 0
+            || claimed_coins_after_tax <= 0.0
+            || !claimed_coins_after_tax.is_finite()
+            || gross_list_value.is_none()
+        {
             let reason = if sold_amount == 0 {
                 "sold_amount_zero".to_string()
+            } else if claimed_coins_after_tax <= 0.0
+                || !claimed_coins_after_tax.is_finite()
+                || gross_list_value.is_none()
+            {
+                "missing_known_sell_claim_value".to_string()
             } else {
                 format!(
                     "insufficient_fifo_lots: needed {}, available {}",
@@ -681,7 +995,13 @@ impl BazaarOrderTracker {
             return audit;
         }
 
-        let mut remaining = sold_amount;
+        let known_fifo_amount = sold_amount.min(available);
+        let unknown_fifo_amount = sold_amount.saturating_sub(known_fifo_amount);
+        let known_ratio = known_fifo_amount as f64 / sold_amount.max(1) as f64;
+        let known_claimed_coins_after_tax = claimed_coins_after_tax * known_ratio;
+        let known_gross_list_value = gross_list_value.map(|value| value * known_ratio);
+
+        let mut remaining = known_fifo_amount;
         let mut lots_used = Vec::new();
         let mut cost_basis_total = 0.0;
         {
@@ -709,30 +1029,68 @@ impl BazaarOrderTracker {
         }
         self.save_buy_cost_lots_to_disk();
 
-        let realized_profit = (claimed_coins_after_tax - cost_basis_total).round() as i64;
+        let realized_profit = (known_claimed_coins_after_tax - cost_basis_total).round() as i64;
+        let remaining_cost_lot_value_after = self.remaining_cost_lot_value_for(item_name);
+        let active_sell_value_after = self.open_order_value_for(item_name, false);
+        let active_buy_value_after = self.open_order_value_for(item_name, true);
+        let can_clear_item_cooldown = remaining_cost_lot_value_after <= 1.0
+            && active_sell_value_after <= 1.0
+            && active_buy_value_after <= 1.0;
+        let cost_basis_status = if unknown_fifo_amount > 0 {
+            CostBasisStatus::PartialKnownCostBasis
+        } else {
+            CostBasisStatus::Known
+        };
+        let reason = if unknown_fifo_amount > 0 {
+            Some(format!(
+                "partial_known_cost_basis: sold {}, known {}, unknown {}",
+                sold_amount, known_fifo_amount, unknown_fifo_amount
+            ))
+        } else {
+            None
+        };
         let audit = SellProfitAudit {
             item_name: item_name.to_string(),
-            sold_amount,
-            claimed_coins_after_tax,
-            gross_list_value,
+            sold_amount: known_fifo_amount,
+            claimed_coins_after_tax: known_claimed_coins_after_tax,
+            gross_list_value: known_gross_list_value,
             lots_used,
             cost_basis_total,
-            cost_basis_status: CostBasisStatus::Known,
+            cost_basis_status,
             realized_profit,
-            reason: None,
+            reason,
         };
         let mut state = self.profit_audit.write();
         state.current_fifo_realized_profit_total += realized_profit;
+        if unknown_fifo_amount > 0 {
+            state.unknown_cost_basis_sell_total_count += 1;
+        }
         state.last_sell_audit = Some(audit.clone());
         state.last_sell_audit_at = Some(Self::now_secs());
         drop(state);
         self.update_performance(item_name, |p| {
             p.sell_orders_filled += 1;
             p.realized_profit_total += realized_profit;
+            if unknown_fifo_amount > 0 {
+                p.unknown_cost_basis_count += 1;
+                p.failed_flips += 1;
+                p.last_failure_timestamp = Some(Self::now_secs());
+            }
             if realized_profit > 0 {
                 p.successful_flips += 1;
                 p.last_success_timestamp = Some(Self::now_secs());
-                p.block_reason = None;
+                if can_clear_item_cooldown {
+                    p.cooldown_until = None;
+                    p.block_reason = None;
+                } else {
+                    debug!(
+                        "[BAF][ITEM_COOLDOWN] item={} action=keep_after_partial_sell remaining_cost_lots={:.0} active_sell={:.0} active_buy={:.0}",
+                        item_name,
+                        remaining_cost_lot_value_after,
+                        active_sell_value_after,
+                        active_buy_value_after
+                    );
+                }
             } else {
                 p.failed_flips += 1;
                 p.last_failure_timestamp = Some(Self::now_secs());
@@ -741,8 +1099,14 @@ impl BazaarOrderTracker {
             p.avg_realized_profit_per_flip = p.realized_profit_total as f64 / flips;
         });
         info!(
-            "[BAF][REALIZED_PROFIT] item={} amount={} cost_basis={:.1} claimed_after_tax={:.1} realized_profit={}",
-            item_name, sold_amount, cost_basis_total, claimed_coins_after_tax, realized_profit
+            "[BAF][REALIZED_PROFIT] item={} amount={} cost_basis={:.1} claimed_after_tax={:.1} realized_profit={} status={} reason={}",
+            item_name,
+            known_fifo_amount,
+            cost_basis_total,
+            known_claimed_coins_after_tax,
+            realized_profit,
+            audit.cost_basis_status.as_str(),
+            audit.reason.as_deref().unwrap_or("none")
         );
         audit
     }
@@ -807,23 +1171,54 @@ impl BazaarOrderTracker {
         let lots_guard = self.buy_cost_lots.read();
         let mut remaining_cost_lots = HashMap::new();
         let mut remaining_cost_lot_value = 0.0;
+        let mut actionable_cost_lot_value = 0.0;
+        let mut blocked_cost_lot_value = 0.0;
         let mut items_waiting_for_sell = Vec::new();
+        let mut blocked_items_waiting_for_sell = Vec::new();
+        let mut item_performance = self.item_performance.read().clone();
         for (item, lots) in lots_guard.iter() {
             let lot_vec: Vec<BuyCostLot> = lots.iter().cloned().collect();
+            let lot_amount: u64 = lots.iter().map(|lot| lot.amount).sum();
             let item_value: f64 = lots
                 .iter()
                 .map(|lot| lot.price_per_unit * lot.amount as f64)
                 .sum();
             remaining_cost_lot_value += item_value;
-            let has_active_sell = active_orders
+            let active_sell_amount: u64 = active_orders
                 .iter()
-                .any(|o| !o.is_buy_order && normalize_for_match(&o.item_name) == *item);
-            if item_value > 0.0 && !has_active_sell {
-                items_waiting_for_sell.push(item.clone());
+                .filter(|o| !o.is_buy_order && normalize_for_match(&o.item_name) == *item)
+                .map(|o| o.amount)
+                .sum();
+            if item_value > 0.0 && active_sell_amount < lot_amount {
+                let blocked_by_cooldown = item_performance
+                    .get(item)
+                    .and_then(|perf| perf.cooldown_until.map(|until| (until, perf)))
+                    .map(|(until, perf)| {
+                        until > now
+                            && perf
+                                .block_reason
+                                .as_deref()
+                                .map(|reason| {
+                                    matches!(
+                                        reason,
+                                        "NEGATIVE_EXPECTED_PROFIT"
+                                            | "PRODUCT_LOOKUP_FAILED"
+                                            | "COST_LOT_NOT_IN_INVENTORY"
+                                    )
+                                })
+                                .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if blocked_by_cooldown {
+                    blocked_items_waiting_for_sell.push(item.clone());
+                    blocked_cost_lot_value += item_value;
+                } else {
+                    items_waiting_for_sell.push(item.clone());
+                    actionable_cost_lot_value += item_value;
+                }
             }
             remaining_cost_lots.insert(item.clone(), lot_vec);
         }
-        let mut item_performance = self.item_performance.read().clone();
         for perf in item_performance.values_mut() {
             perf.current_open_buy_capital = active_orders
                 .iter()
@@ -841,6 +1236,8 @@ impl BazaarOrderTracker {
                 })
                 .map(|o| o.price_per_unit * o.amount as f64)
                 .sum();
+            perf.current_cost_lot_value = 0.0;
+            perf.max_cost_lot_age_seconds = 0;
             if let Some(lots) = lots_guard.get(&normalize_for_match(&perf.item_name)) {
                 perf.current_cost_lot_value = lots
                     .iter()
@@ -868,6 +1265,9 @@ impl BazaarOrderTracker {
             stale_buy_orders,
             stale_sell_orders,
             items_waiting_for_sell,
+            blocked_items_waiting_for_sell,
+            blocked_cost_lot_value,
+            actionable_cost_lot_value,
             last_sell_audit_at: state.last_sell_audit_at,
             web_graph_source: "local_fifo_known_cost_basis_only".to_string(),
             last_sell_audit: state.last_sell_audit,
@@ -904,7 +1304,7 @@ impl BazaarOrderTracker {
     ) {
         self.planned_local_sells.write().insert(
             normalize_for_match(item_name),
-            (sell_price_per_unit, item_tag, None),
+            (sell_price_per_unit, item_tag, None, Self::now_secs()),
         );
     }
 
@@ -918,16 +1318,194 @@ impl BazaarOrderTracker {
     ) {
         self.planned_local_sells.write().insert(
             normalize_for_match(item_name),
-            (sell_price_per_unit, item_tag, Some(amount)),
+            (
+                sell_price_per_unit,
+                item_tag,
+                Some(amount),
+                Self::now_secs(),
+            ),
         );
     }
 
     /// Return the remembered local SELL amount without consuming the planned sell.
     pub fn planned_local_sell_amount(&self, item_name: &str) -> Option<u64> {
-        self.planned_local_sells
+        let key = normalize_for_match(item_name);
+        let now = Self::now_secs();
+        let mut planned = self.planned_local_sells.write();
+        let Some((_, _, amount, recorded_at)) = planned.get(&key).cloned() else {
+            return None;
+        };
+        if amount.is_some()
+            && now.saturating_sub(recorded_at) > PLANNED_LOCAL_SELL_ORDER_TTL_SECONDS
+        {
+            planned.remove(&key);
+            warn!(
+                "[BAF][PLANNED_SELL_EXPIRED] item={} planned_amount={} age={}s action=clear_stale_sell_escrow",
+                item_name,
+                amount.unwrap_or(0),
+                now.saturating_sub(recorded_at)
+            );
+            return None;
+        }
+        amount
+    }
+
+    pub fn planned_local_sell(
+        &self,
+        item_name: &str,
+    ) -> Option<(f64, Option<String>, Option<u64>)> {
+        let key = normalize_for_match(item_name);
+        let now = Self::now_secs();
+        let mut planned = self.planned_local_sells.write();
+        let Some((price, tag, amount, recorded_at)) = planned.get(&key).cloned() else {
+            return None;
+        };
+        if amount.is_some()
+            && now.saturating_sub(recorded_at) > PLANNED_LOCAL_SELL_ORDER_TTL_SECONDS
+        {
+            planned.remove(&key);
+            warn!(
+                "[BAF][PLANNED_SELL_EXPIRED] item={} planned_amount={} age={}s action=clear_stale_sell_escrow",
+                item_name,
+                amount.unwrap_or(0),
+                now.saturating_sub(recorded_at)
+            );
+            return None;
+        }
+        Some((price, tag, amount))
+    }
+
+    pub fn remaining_cost_lot_amount_for(&self, item_name: &str) -> u64 {
+        self.buy_cost_lots
             .read()
             .get(&normalize_for_match(item_name))
-            .and_then(|(_, _, amount)| *amount)
+            .map(|lots| lots.iter().map(|lot| lot.amount).sum())
+            .unwrap_or(0)
+    }
+
+    pub fn active_sell_amount_for(&self, item_name: &str) -> u64 {
+        let normalized = normalize_for_match(item_name);
+        self.orders
+            .read()
+            .iter()
+            .filter(|order| {
+                !order.is_buy_order
+                    && (order.status == "open" || order.status == "filled")
+                    && normalize_for_match(&order.item_name) == normalized
+            })
+            .map(|order| order.amount)
+            .sum()
+    }
+
+    pub fn active_sell_order_count_for(&self, item_name: &str) -> usize {
+        let normalized = normalize_for_match(item_name);
+        self.orders
+            .read()
+            .iter()
+            .filter(|order| {
+                !order.is_buy_order
+                    && (order.status == "open" || order.status == "filled")
+                    && normalize_for_match(&order.item_name) == normalized
+            })
+            .count()
+    }
+
+    pub fn duplicate_active_sell_order_target(&self) -> Option<(String, usize, u64)> {
+        let mut grouped: HashMap<String, (String, usize, u64, u64)> = HashMap::new();
+        for order in self.orders.read().iter().filter(|order| {
+            !order.is_buy_order
+                && order.amount > 0
+                && (order.status == "open" || order.status == "filled")
+        }) {
+            let normalized = normalize_for_match(&order.item_name);
+            let entry = grouped.entry(normalized).or_insert((
+                order.item_name.clone(),
+                0,
+                0,
+                order.placed_at,
+            ));
+            entry.1 += 1;
+            entry.2 = entry.2.saturating_add(order.amount);
+            if order.placed_at <= entry.3 {
+                entry.0 = order.item_name.clone();
+                entry.3 = order.placed_at;
+            }
+        }
+
+        grouped
+            .into_values()
+            .filter(|(_, count, _, _)| *count > 1)
+            .max_by(|a, b| {
+                a.1.cmp(&b.1)
+                    .then_with(|| a.2.cmp(&b.2))
+                    .then_with(|| b.3.cmp(&a.3))
+            })
+            .map(|(item_name, count, amount, _)| (item_name, count, amount))
+    }
+
+    pub fn mark_cost_lots_missing_from_inventory(
+        &self,
+        item_name: &str,
+        observed_inventory_amount: u64,
+    ) -> Option<(u64, f64)> {
+        self.mark_cost_lot_excess_missing_from_inventory(
+            item_name,
+            observed_inventory_amount,
+            observed_inventory_amount,
+        )
+    }
+
+    pub fn mark_cost_lot_excess_missing_from_inventory(
+        &self,
+        item_name: &str,
+        keep_amount: u64,
+        observed_inventory_amount: u64,
+    ) -> Option<(u64, f64)> {
+        let key = normalize_for_match(item_name);
+        let mut map = self.buy_cost_lots.write();
+        let lots = map.get_mut(&key)?;
+        let total_amount: u64 = lots.iter().map(|lot| lot.amount).sum();
+        let mut amount_to_remove = total_amount.saturating_sub(keep_amount);
+        if amount_to_remove == 0 {
+            return None;
+        }
+
+        let mut removed_amount = 0u64;
+        let mut removed_value = 0.0;
+        while amount_to_remove > 0 {
+            let Some(mut lot) = lots.pop_back() else {
+                break;
+            };
+            if lot.amount <= amount_to_remove {
+                removed_amount += lot.amount;
+                removed_value += lot.price_per_unit * lot.amount as f64;
+                amount_to_remove -= lot.amount;
+            } else {
+                removed_amount += amount_to_remove;
+                removed_value += lot.price_per_unit * amount_to_remove as f64;
+                lot.amount -= amount_to_remove;
+                lots.push_back(lot);
+                amount_to_remove = 0;
+            }
+        }
+        if lots.is_empty() {
+            map.remove(&key);
+            self.planned_local_sells.write().remove(&key);
+        }
+        drop(map);
+
+        self.save_buy_cost_lots_to_disk();
+        self.update_performance(item_name, |p| {
+            p.failed_flips += removed_amount.max(1);
+            p.last_failure_timestamp = Some(Self::now_secs());
+            p.cooldown_until = Some(Self::now_secs() + 1800);
+            p.block_reason = Some("COST_LOT_NOT_IN_INVENTORY".to_string());
+        });
+        warn!(
+            "[BAF][COST_LOT_MISSING_INVENTORY] item={} removed_fifo_amount={} removed_fifo_value={:.1} kept_fifo_amount={} observed_inventory_amount={} action=removed_missing_fifo_excess",
+            item_name, removed_amount, removed_value, keep_amount, observed_inventory_amount
+        );
+        Some((removed_amount, removed_value))
     }
 
     /// Consume the target sell price after the corresponding BUY order is collected.
@@ -935,7 +1513,7 @@ impl BazaarOrderTracker {
         self.planned_local_sells
             .write()
             .remove(&normalize_for_match(item_name))
-            .map(|(price, tag, _)| (price, tag))
+            .map(|(price, tag, _, _)| (price, tag))
     }
 
     // ── Persistence helpers ──
@@ -996,6 +1574,31 @@ impl BazaarOrderTracker {
         }
     }
 
+    fn save_item_performance_to_disk(&self) {
+        #[cfg(test)]
+        return;
+        #[cfg(not(test))]
+        {
+            let performance = self.item_performance.read().clone();
+            let path = Self::persistence_dir().join(ITEM_PERFORMANCE_FILE);
+            if let Err(e) = std::fs::create_dir_all(Self::persistence_dir()) {
+                warn!("[BazaarTracker] Failed to create persistence dir: {}", e);
+                return;
+            }
+            match serde_json::to_string(&performance) {
+                Ok(json) => {
+                    if let Err(e) = std::fs::write(&path, json) {
+                        warn!("[BazaarTracker] Failed to write {}: {}", path.display(), e);
+                    }
+                }
+                Err(e) => warn!(
+                    "[BazaarTracker] Failed to serialize item performance: {}",
+                    e
+                ),
+            }
+        }
+    }
+
     fn load_from_disk(&self) {
         let orders_path = Self::persistence_dir().join(ORDERS_FILE);
         if orders_path.exists() {
@@ -1035,10 +1638,15 @@ impl BazaarOrderTracker {
                             "[BazaarTracker] Loaded FIFO buy-cost lots for {} items",
                             costs.len()
                         );
-                        *self.buy_cost_lots.write() = costs
-                            .into_iter()
-                            .map(|(item, lots)| (item, VecDeque::from(lots)))
-                            .collect();
+                        let mut normalized_costs: HashMap<String, VecDeque<BuyCostLot>> =
+                            HashMap::new();
+                        for (item, lots) in costs {
+                            normalized_costs
+                                .entry(normalize_for_match(&item))
+                                .or_default()
+                                .extend(lots);
+                        }
+                        *self.buy_cost_lots.write() = normalized_costs;
                     }
                     Err(e) => warn!(
                         "[BazaarTracker] Failed to parse {}: {}",
@@ -1053,11 +1661,95 @@ impl BazaarOrderTracker {
                 ),
             }
         }
+
+        let perf_path = Self::persistence_dir().join(ITEM_PERFORMANCE_FILE);
+        if perf_path.exists() {
+            match std::fs::read_to_string(&perf_path) {
+                Ok(json) => match serde_json::from_str::<HashMap<String, ItemPerformance>>(&json) {
+                    Ok(performance) => {
+                        let normalized: HashMap<String, ItemPerformance> = performance
+                            .into_values()
+                            .map(|mut perf| {
+                                let key = if perf.item_name.trim().is_empty() {
+                                    normalize_for_match(&perf.product_id)
+                                } else {
+                                    normalize_for_match(&perf.item_name)
+                                };
+                                if perf.product_id.trim().is_empty() {
+                                    perf.product_id = key.clone();
+                                }
+                                (key, perf)
+                            })
+                            .collect();
+                        debug!(
+                            "[BazaarTracker] Loaded item performance for {} items",
+                            normalized.len()
+                        );
+                        *self.item_performance.write() = normalized;
+                    }
+                    Err(e) => warn!(
+                        "[BazaarTracker] Failed to parse {}: {}",
+                        perf_path.display(),
+                        e
+                    ),
+                },
+                Err(e) => warn!(
+                    "[BazaarTracker] Failed to read {}: {}",
+                    perf_path.display(),
+                    e
+                ),
+            }
+        }
     }
 }
 
 fn normalize_for_match(name: &str) -> String {
-    name.to_lowercase().trim().to_string()
+    let mut without_formatting = String::with_capacity(name.len());
+    let mut chars = name.trim().chars();
+    while let Some(ch) = chars.next() {
+        if ch == '§' {
+            let _ = chars.next();
+            continue;
+        }
+        without_formatting.push(ch);
+    }
+    let trimmed = without_formatting.trim();
+    let identity_start = trimmed
+        .char_indices()
+        .find(|(_, ch)| ch.is_alphanumeric())
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+
+    let normalized = trimmed[identity_start..]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+
+    const GEM_TIERS: &[&str] = &["rough", "flawed", "fine", "flawless", "perfect"];
+    const GEM_TYPES: &[&str] = &[
+        "amber",
+        "amethyst",
+        "aquamarine",
+        "citrine",
+        "jade",
+        "jasper",
+        "onyx",
+        "opal",
+        "peridot",
+        "ruby",
+        "sapphire",
+        "topaz",
+    ];
+    for tier in GEM_TIERS {
+        for gem in GEM_TYPES {
+            if normalized == format!("{tier} {gem} gem") {
+                return format!("{tier} {gem} gemstone");
+            }
+        }
+    }
+
+    normalized
 }
 
 /// Public wrapper for `normalize_for_match` — used by `ManageOrders` targeted cancel.
@@ -1068,6 +1760,131 @@ pub fn normalize_for_match_pub(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_strips_bazaar_display_prefixes_for_exposure_matching() {
+        assert_eq!(
+            normalize_for_match("✎ Flawless Sapphire Gemstone"),
+            normalize_for_match("Flawless Sapphire Gemstone")
+        );
+        assert_eq!(
+            normalize_for_match("⸕ Flawless Amber Gemstone"),
+            normalize_for_match("Flawless Amber Gemstone")
+        );
+        assert_eq!(
+            normalize_for_match("§a✎ Flawless Sapphire Gemstone"),
+            "flawless sapphire gemstone"
+        );
+        assert_eq!(
+            normalize_for_match("⸕ Flawless Amber Gem"),
+            normalize_for_match("Flawless Amber Gemstone")
+        );
+    }
+
+    #[test]
+    fn partial_bazaar_collect_reduces_order_instead_of_removing_it() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.add_order("Carrot Zest".into(), 6, 556_808.9, true);
+
+        let collected = tracker
+            .remove_or_reduce_order_on_collect("Carrot Zest", true, Some(2))
+            .expect("collected portion should be returned");
+
+        assert_eq!(collected.amount, 2);
+        let orders = tracker.get_orders();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].amount, 4);
+        assert_eq!(orders[0].status, "open");
+        assert!(orders[0].is_buy_order);
+    }
+
+    #[test]
+    fn reconcile_does_not_restore_partially_collected_buy_amount() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.add_order("Enchanted Titanium".into(), 161, 21_723.5, true);
+        let collected = tracker
+            .remove_or_reduce_order_on_collect("Enchanted Titanium", true, Some(11))
+            .expect("partial collect should return collected amount");
+        assert_eq!(collected.amount, 11);
+        tracker.record_buy_cost("Enchanted Titanium", 21_723.5, 11);
+
+        let ingame = vec![("Enchanted Titanium".to_string(), true, 161, 21_723.5)];
+        let removed = tracker.reconcile_with_ingame(&ingame);
+        assert_eq!(removed, 0);
+        let orders = tracker.get_orders();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].amount, 150);
+    }
+
+    #[test]
+    fn reconcile_does_not_restore_partially_collected_sell_amount() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.record_buy_cost("Flawless Amber Gemstone", 2_850_000.6, 3);
+        tracker.add_order("Flawless Amber Gemstone".into(), 3, 3_193_804.4, false);
+        let collected = tracker
+            .remove_or_reduce_order_on_collect("Flawless Amber Gemstone", false, Some(2))
+            .expect("partial sell collect should return collected amount");
+        assert_eq!(collected.amount, 2);
+        let audit = tracker.account_sell_collect(
+            "Flawless Amber Gemstone",
+            2,
+            6_307_763.69,
+            Some(6_387_608.8),
+        );
+        assert_eq!(audit.cost_basis_status, CostBasisStatus::Known);
+
+        let ingame = vec![(
+            "⸕ Flawless Amber Gemstone".to_string(),
+            false,
+            3,
+            3_193_804.4,
+        )];
+        let removed = tracker.reconcile_with_ingame(&ingame);
+        assert_eq!(removed, 0);
+        let orders = tracker.get_orders();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].amount, 1);
+        assert!(!orders[0].is_buy_order);
+        assert_eq!(
+            tracker.remaining_cost_lot_amount_for("Flawless Amber Gemstone"),
+            1
+        );
+    }
+
+    #[test]
+    fn cancel_removes_oldest_same_item_order_to_avoid_relist_churn() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.add_order("Carrot Zest".into(), 2, 618_010.9, false);
+        tracker.add_order("Carrot Zest".into(), 2, 618_010.4, false);
+
+        let cancelled = tracker
+            .remove_oldest_order("Carrot Zest", false)
+            .expect("oldest sell should be removed");
+
+        assert_eq!(cancelled.price_per_unit, 618_010.9);
+        let orders = tracker.get_orders();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].price_per_unit, 618_010.4);
+        assert!(!orders[0].is_buy_order);
+    }
+
+    #[test]
+    fn active_sell_count_and_duplicate_target_group_same_item_orders() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.add_order("Enchanted Lily Pad".into(), 64, 31_168.6, false);
+        tracker.add_order("Enchanted Lily Pad".into(), 116, 31_299.8, false);
+        tracker.add_order("Kismet Feather".into(), 2, 1_512_000.0, true);
+
+        assert_eq!(tracker.active_sell_order_count_for("enchanted lily pad"), 2);
+        assert_eq!(tracker.active_sell_amount_for("Enchanted Lily Pad"), 180);
+
+        let duplicate = tracker
+            .duplicate_active_sell_order_target()
+            .expect("duplicate sell item should be detected");
+        assert_eq!(normalize_for_match(&duplicate.0), "enchanted lily pad");
+        assert_eq!(duplicate.1, 2);
+        assert_eq!(duplicate.2, 180);
+    }
 
     #[test]
     fn crystalized_moonlight_fifo_profit_is_positive() {
@@ -1093,7 +1910,7 @@ mod tests {
     }
 
     #[test]
-    fn sell_without_enough_lots_is_unknown_and_does_not_change_profit() {
+    fn mixed_known_and_unknown_sell_realizes_only_known_fifo_profit() {
         let tracker = BazaarOrderTracker::new_in_memory();
         tracker.record_buy_cost("Crystalized Moonlight", 460_003.1, 10);
 
@@ -1104,15 +1921,115 @@ mod tests {
             Some(8_720_000.0),
         );
 
+        assert_eq!(
+            audit.cost_basis_status,
+            CostBasisStatus::PartialKnownCostBasis
+        );
+        assert_eq!(audit.sold_amount, 10);
+        assert_eq!(audit.cost_basis_total.round() as i64, 4_600_031);
+        assert_eq!(audit.realized_profit, 464_675);
+        let snapshot = tracker.profit_audit_snapshot();
+        assert_eq!(snapshot.current_fifo_realized_profit_total, 464_675);
+        assert_eq!(snapshot.unknown_cost_basis_sell_total_count, 1);
+        assert!(!snapshot
+            .remaining_cost_lots
+            .contains_key("crystalized moonlight"));
+        assert_eq!(
+            audit.reason.as_deref(),
+            Some("partial_known_cost_basis: sold 17, known 10, unknown 7")
+        );
+    }
+
+    #[test]
+    fn busted_belt_buckle_mixed_sell_consumes_known_remainder_without_counting_unknown() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.record_buy_cost("Busted Belt Buckle", 266_805.5, 5);
+
+        let audit = tracker.account_sell_collect(
+            "Busted Belt Buckle",
+            14,
+            4_147_410.1375,
+            Some(4_199_909.0),
+        );
+
+        assert_eq!(
+            audit.cost_basis_status,
+            CostBasisStatus::PartialKnownCostBasis
+        );
+        assert_eq!(audit.sold_amount, 5);
+        assert_eq!(audit.cost_basis_total, 1_334_027.5);
+        assert_eq!(audit.realized_profit, 147_190);
+        assert_eq!(
+            audit.reason.as_deref(),
+            Some("partial_known_cost_basis: sold 14, known 5, unknown 9")
+        );
+        let snapshot = tracker.profit_audit_snapshot();
+        assert_eq!(snapshot.current_fifo_realized_profit_total, 147_190);
+        assert_eq!(snapshot.unknown_cost_basis_sell_total_count, 1);
+        assert!(!snapshot
+            .remaining_cost_lots
+            .contains_key("busted belt buckle"));
+    }
+
+    #[test]
+    fn sell_without_known_claim_value_does_not_consume_fifo_or_count_profit() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.record_buy_cost("Melon Juice", 162_566.1, 21);
+
+        let audit = tracker.account_sell_collect("Melon Juice", 21, 0.0, None);
+
         assert_eq!(audit.cost_basis_status, CostBasisStatus::UnknownCostBasis);
         assert_eq!(audit.realized_profit, 0);
+        assert_eq!(
+            audit.reason.as_deref(),
+            Some("missing_known_sell_claim_value")
+        );
         let snapshot = tracker.profit_audit_snapshot();
         assert_eq!(snapshot.current_fifo_realized_profit_total, 0);
         assert_eq!(snapshot.unknown_cost_basis_sell_total_count, 1);
-        assert_eq!(
-            snapshot.remaining_cost_lots["crystalized moonlight"][0].amount,
-            10
+        assert_eq!(snapshot.remaining_cost_lots["melon juice"][0].amount, 21);
+    }
+
+    #[test]
+    fn sell_collect_clears_stale_planned_sell_guard_even_when_unknown() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.record_planned_local_sell_amount("Busted Belt Buckle", 299_993.5, None, 13);
+
+        let audit = tracker.account_sell_collect("Busted Belt Buckle", 14, 0.0, None);
+
+        assert_eq!(audit.cost_basis_status, CostBasisStatus::UnknownCostBasis);
+        assert!(tracker
+            .planned_local_sell_amount("Busted Belt Buckle")
+            .is_none());
+    }
+
+    #[test]
+    fn stale_planned_sell_order_escrow_expires_but_buy_target_price_survives() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        let stale_at =
+            BazaarOrderTracker::now_secs().saturating_sub(PLANNED_LOCAL_SELL_ORDER_TTL_SECONDS + 1);
+        tracker.planned_local_sells.write().insert(
+            normalize_for_match("Busted Belt Buckle"),
+            (299_993.5, None, Some(5), stale_at),
         );
+        tracker.planned_local_sells.write().insert(
+            normalize_for_match("Flawless Amber Gemstone"),
+            (
+                3_193_811.6,
+                Some("PERFECT_AMBER_GEM".to_string()),
+                None,
+                stale_at,
+            ),
+        );
+
+        assert!(tracker
+            .planned_local_sell_amount("Busted Belt Buckle")
+            .is_none());
+        let planned_target = tracker
+            .planned_local_sell("Flawless Amber Gemstone")
+            .expect("buy target price should not expire");
+        assert_eq!(planned_target.0, 3_193_811.6);
+        assert!(planned_target.2.is_none());
     }
 
     #[test]
@@ -1393,6 +2310,26 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_price_change_refreshes_order_age() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.add_order("Flawless Sapphire Gemstone".into(), 1, 3_027_535.9, false);
+        tracker.orders.write()[0].placed_at = 100;
+
+        let ingame = vec![(
+            "✎ Flawless Sapphire Gemstone".to_string(),
+            false,
+            1,
+            3_027_533.9,
+        )];
+        let removed = tracker.reconcile_with_ingame(&ingame);
+        assert_eq!(removed, 0);
+        let orders = tracker.get_orders();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].price_per_unit, 3_027_533.9);
+        assert!(orders[0].placed_at > 100);
+    }
+
+    #[test]
     fn reconcile_duplicate_same_item_orders() {
         let tracker = BazaarOrderTracker::new_in_memory();
         // Tracker has 3 "Coal" buy orders
@@ -1450,6 +2387,113 @@ mod tests {
         assert_eq!(diamond.amount, 10);
         assert!((diamond.price_per_unit - 1200.5).abs() < 0.01);
         assert!(!diamond.is_buy_order);
+    }
+
+    #[test]
+    fn reconcile_preserves_fifo_backed_sell_missing_from_snapshot() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.record_buy_cost("Melon Juice", 162_566.1, 21);
+        tracker.add_order("Melon Juice".into(), 21, 189_835.3, false);
+
+        let removed = tracker.reconcile_with_ingame(&[]);
+
+        assert_eq!(removed, 0);
+        let snapshot = tracker.profit_audit_snapshot();
+        assert_eq!(snapshot.active_sell_orders, 1);
+        assert!(snapshot.items_waiting_for_sell.is_empty());
+        assert_eq!(snapshot.remaining_cost_lots["melon juice"][0].amount, 21);
+    }
+
+    #[test]
+    fn reconcile_removes_unbacked_sell_missing_from_snapshot() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.add_order("Crystalized Moonlight".into(), 6, 720_000.0, false);
+
+        let removed = tracker.reconcile_with_ingame(&[]);
+
+        assert_eq!(removed, 1);
+        assert!(tracker.get_orders().is_empty());
+    }
+
+    #[test]
+    fn product_lookup_failure_clears_planned_sell_and_cooldowns_item() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.record_planned_local_sell(
+            "Enchanted Water Lily",
+            32_599.9,
+            Some("ENCHANTED_WATER_LILY".to_string()),
+        );
+
+        tracker.record_product_lookup_failed("Enchanted Water Lily", "PRODUCT_LOOKUP_FAILED");
+
+        assert!(tracker.planned_local_sell("Enchanted Water Lily").is_none());
+        let snapshot = tracker.profit_audit_snapshot();
+        let perf = &snapshot.item_performance["enchanted water lily"];
+        assert_eq!(perf.failed_search_count, 1);
+        assert_eq!(perf.failed_flips, 1);
+        assert_eq!(perf.block_reason.as_deref(), Some("PRODUCT_LOOKUP_FAILED"));
+        assert!(tracker
+            .item_cooldown_reason("Enchanted Water Lily")
+            .is_some());
+    }
+
+    #[test]
+    fn successful_fifo_sell_clears_previous_item_cooldown() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.record_product_lookup_failed("Kismet Feather", "PRODUCT_LOOKUP_FAILED");
+        assert!(tracker.item_cooldown_reason("Kismet Feather").is_some());
+
+        tracker.record_buy_cost("Kismet Feather", 1_450_672.7, 2);
+        let audit =
+            tracker.account_sell_collect("Kismet Feather", 2, 3_119_218.0, Some(3_154_708.0));
+
+        assert_eq!(audit.cost_basis_status, CostBasisStatus::Known);
+        assert!(audit.realized_profit > 0);
+        assert!(tracker.item_cooldown_reason("Kismet Feather").is_none());
+        let snapshot = tracker.profit_audit_snapshot();
+        let perf = &snapshot.item_performance["kismet feather"];
+        assert_eq!(perf.block_reason, None);
+        assert_eq!(perf.cooldown_until, None);
+        assert_eq!(perf.successful_flips, 1);
+    }
+
+    #[test]
+    fn partial_fifo_sell_keeps_cooldown_while_exposure_remains() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.record_buy_cost("Flawless Amber Gemstone", 2_850_000.6, 3);
+        tracker.add_order("Flawless Amber Gemstone".into(), 3, 3_193_804.4, false);
+        tracker.cooldown_item("Flawless Amber Gemstone", "CAPITAL_BLOCKER", 1_800);
+        assert!(tracker
+            .item_cooldown_reason("Flawless Amber Gemstone")
+            .is_some());
+
+        tracker.remove_or_reduce_order_on_collect("Flawless Amber Gemstone", false, Some(2));
+        let audit = tracker.account_sell_collect(
+            "Flawless Amber Gemstone",
+            2,
+            6_307_763.69,
+            Some(6_387_608.8),
+        );
+
+        assert_eq!(audit.cost_basis_status, CostBasisStatus::Known);
+        assert!(audit.realized_profit > 0);
+        let (_, reason) = tracker
+            .item_cooldown_reason("Flawless Amber Gemstone")
+            .expect("cooldown should remain while one listed sell is still open");
+        assert_eq!(reason, "CAPITAL_BLOCKER");
+    }
+
+    #[test]
+    fn manual_item_cooldown_sets_reason_and_blocks_candidate() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+
+        tracker.cooldown_item("Flawless Amber Gemstone", "capital_blocker", 1_800);
+
+        let Some((until, reason)) = tracker.item_cooldown_reason("Flawless Amber Gemstone") else {
+            panic!("cooldown should be active");
+        };
+        assert_eq!(reason, "CAPITAL_BLOCKER");
+        assert!(until > BazaarOrderTracker::now_secs());
     }
 
     #[test]
@@ -1547,6 +2591,26 @@ mod tests {
             snapshot.item_performance["designer coffee beans"].negative_profit_block_count,
             1
         );
+    }
+
+    #[test]
+    fn negative_sell_cost_lot_is_blocked_not_actionable_backlog() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        tracker.record_buy_cost("Summoning Eye", 1_578_979.1, 1);
+
+        let check = tracker.validate_sell_before_order("Summoning Eye", 1, 1_400_000.0, 1.25);
+        assert!(!check.allowed);
+        assert_eq!(check.reason, Some(SellBlockReason::NegativeExpectedProfit));
+
+        let snapshot = tracker.profit_audit_snapshot();
+        assert!(snapshot.items_waiting_for_sell.is_empty());
+        assert_eq!(
+            snapshot.blocked_items_waiting_for_sell,
+            vec!["summoning eye".to_string()]
+        );
+        assert_eq!(snapshot.actionable_cost_lot_value, 0.0);
+        assert!(snapshot.blocked_cost_lot_value > 0.0);
+        assert_eq!(snapshot.remaining_cost_lots["summoning eye"][0].amount, 1);
     }
 
     #[test]
